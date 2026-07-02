@@ -256,21 +256,26 @@ class TestFormatEditDiff:
 
 class TestFormatToolResultText:
     @pytest.mark.parametrize(
-        "text, tool_name, check",
+        "text, tool_name, tool_input_data, check",
         [
             (
                 "line1\nline2\nline3",
                 "Read",
+                None,
                 lambda r: r == "  ⎿  Read 3 lines",
             ),
             (
-                "line1\nline2",
+                # Write's line count comes from the input content, not the
+                # result text (result is usually just a confirmation string).
+                "File created successfully",
                 "Write",
+                {"content": "line1\nline2"},
                 lambda r: r == "  ⎿  Wrote 2 lines",
             ),
             (
                 "output line",
                 "Bash",
+                None,
                 lambda r: (
                     r.startswith("  ⎿  Output 1 lines")
                     and EXPQUOTE_START in r
@@ -280,21 +285,25 @@ class TestFormatToolResultText:
             (
                 "file1.py\nfile2.py\n",
                 "Grep",
+                None,
                 lambda r: "Found 2 matches" in r and EXPQUOTE_START in r,
             ),
             (
                 "a.py\nb.py\nc.py",
                 "Glob",
+                None,
                 lambda r: "Found 3 files" in r and EXPQUOTE_START in r,
             ),
             (
                 "agent says hello",
                 "Task",
+                None,
                 lambda r: "Agent output 1 lines" in r and EXPQUOTE_START in r,
             ),
             (
                 "page content here",
                 "WebFetch",
+                None,
                 lambda r: (
                     f"Fetched {len('page content here')} characters" in r
                     and EXPQUOTE_START in r
@@ -303,13 +312,18 @@ class TestFormatToolResultText:
             (
                 "",
                 "Read",
+                None,
                 lambda r: r == "",
             ),
         ],
         ids=["Read", "Write", "Bash", "Grep", "Glob", "Task", "WebFetch", "empty"],
     )
-    def test_format_tool_result_text(self, text: str, tool_name: str, check):
-        result = TranscriptParser._format_tool_result_text(text, tool_name)
+    def test_format_tool_result_text(
+        self, text: str, tool_name: str, tool_input_data, check
+    ):
+        result = TranscriptParser._format_tool_result_text(
+            text, tool_name, tool_input_data
+        )
         assert check(result), f"Failed check for {tool_name!r}: {result!r}"
 
 

@@ -127,6 +127,7 @@ from .handlers.message_sender import (
     send_with_fallback,
 )
 from .markdown_v2 import convert_markdown
+from .mirror import mirror_poll_loop
 from .handlers.response_builder import build_response_parts
 from .handlers.status_polling import status_poll_loop
 from .screenshot import text_to_image
@@ -145,6 +146,9 @@ session_monitor: SessionMonitor | None = None
 
 # Status polling task
 _status_poll_task: asyncio.Task | None = None
+
+# Auto-topic mirror polling task (only started when CCBOT_MIRROR_CHAT_ID is set)
+_mirror_poll_task: asyncio.Task | None = None
 
 # Claude Code commands shown in bot menu (forwarded via tmux)
 CC_COMMANDS: dict[str, str] = {
@@ -1814,7 +1818,7 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
 
 
 async def post_init(application: Application) -> None:
-    global session_monitor, _status_poll_task
+    global session_monitor, _status_poll_task, _mirror_poll_task
 
     await application.bot.delete_my_commands()
 
@@ -1861,9 +1865,15 @@ async def post_init(application: Application) -> None:
     _status_poll_task = asyncio.create_task(status_poll_loop(application.bot))
     logger.info("Status polling task started")
 
+    # Start auto-topic mirror polling task (no-op loop if config.mirror_chat_id
+    # is unset, so only bother starting it when the feature is enabled)
+    if config.mirror_chat_id:
+        _mirror_poll_task = asyncio.create_task(mirror_poll_loop(application.bot))
+        logger.info("Mirror polling task started (chat_id=%d)", config.mirror_chat_id)
+
 
 async def post_shutdown(application: Application) -> None:
-    global _status_poll_task
+    global _status_poll_task, _mirror_poll_task
 
     # Stop status polling
     if _status_poll_task:
@@ -1874,6 +1884,16 @@ async def post_shutdown(application: Application) -> None:
             pass
         _status_poll_task = None
         logger.info("Status polling stopped")
+
+    # Stop mirror polling
+    if _mirror_poll_task:
+        _mirror_poll_task.cancel()
+        try:
+            await _mirror_poll_task
+        except asyncio.CancelledError:
+            pass
+        _mirror_poll_task = None
+        logger.info("Mirror polling stopped")
 
     # Stop all queue workers
     await shutdown_workers()

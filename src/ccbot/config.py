@@ -107,6 +107,15 @@ class Config:
             "OPENAI_BASE_URL", "https://api.openai.com/v1"
         )
 
+        # Auto-topic mirror (optional): chat_id of a forum group where topics
+        # are auto-created for tmux windows that have a tracked Claude session
+        # but no thread binding yet (e.g. Mac-launched terminal tabs). Unset
+        # (default) disables the feature entirely — see mirror.py.
+        mirror_chat_id_str = os.getenv("CCBOT_MIRROR_CHAT_ID", "")
+        self.mirror_chat_id: int | None = (
+            int(mirror_chat_id_str) if mirror_chat_id_str else None
+        )
+
         # Scrub sensitive vars from os.environ so child processes never inherit them.
         # Values are already captured in Config attributes above.
         for var in SENSITIVE_ENV_VARS:

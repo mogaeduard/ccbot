@@ -117,3 +117,21 @@ class TestConfigOpenAI:
         monkeypatch.setenv("OPENAI_API_KEY", "sk-secret")
         Config()
         assert os.environ.get("OPENAI_API_KEY") is None
+
+
+@pytest.mark.usefixtures("_base_env")
+class TestConfigMirrorChatId:
+    def test_default_unset(self, monkeypatch):
+        monkeypatch.delenv("CCBOT_MIRROR_CHAT_ID", raising=False)
+        cfg = Config()
+        assert cfg.mirror_chat_id is None
+
+    def test_custom_mirror_chat_id(self, monkeypatch):
+        monkeypatch.setenv("CCBOT_MIRROR_CHAT_ID", "-1001234567890")
+        cfg = Config()
+        assert cfg.mirror_chat_id == -1001234567890
+
+    def test_non_numeric_mirror_chat_id_raises(self, monkeypatch):
+        monkeypatch.setenv("CCBOT_MIRROR_CHAT_ID", "not-a-number")
+        with pytest.raises(ValueError):
+            Config()
