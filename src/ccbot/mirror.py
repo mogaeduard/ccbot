@@ -91,12 +91,7 @@ async def _close_dead_topics(bot: Bot, mirror_chat_id: int) -> None:
             continue  # not a mirror-owned binding — leave to normal cleanup
 
         display = session_manager.get_display_name(window_id)
-        try:
-            await bot.close_forum_topic(
-                chat_id=mirror_chat_id, message_thread_id=thread_id
-            )
-        except TelegramError as e:
-            logger.debug("Mirror: failed to close topic %d: %s", thread_id, e)
+        # Notice before close: bots may not be able to post into a closed topic.
         try:
             await safe_send(
                 bot,
@@ -110,6 +105,12 @@ async def _close_dead_topics(bot: Bot, mirror_chat_id: int) -> None:
                 thread_id,
                 e,
             )
+        try:
+            await bot.close_forum_topic(
+                chat_id=mirror_chat_id, message_thread_id=thread_id
+            )
+        except TelegramError as e:
+            logger.debug("Mirror: failed to close topic %d: %s", thread_id, e)
 
         session_manager.unbind_thread(user_id, thread_id)
         await clear_topic_state(user_id, thread_id, bot)

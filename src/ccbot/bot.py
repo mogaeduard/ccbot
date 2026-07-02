@@ -1121,6 +1121,9 @@ async def _create_and_bind_window(
                 )
                 if not send_ok:
                     logger.warning("Failed to forward pending text: %s", send_msg)
+                    resolved_chat = session_manager.resolve_chat_id(
+                        user.id, pending_thread_id
+                    )
                     await safe_send(
                         context.bot,
                         resolved_chat,
@@ -1499,6 +1502,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             )
             if not send_ok:
                 logger.warning("Failed to forward pending text: %s", send_msg)
+                resolved_chat = session_manager.resolve_chat_id(user.id, thread_id)
                 await safe_send(
                     context.bot,
                     resolved_chat,
@@ -1777,7 +1781,10 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
             await clear_interactive_msg(user_id, bot, thread_id)
 
         # Skip tool call notifications when CCBOT_SHOW_TOOL_CALLS=false
-        if not config.show_tool_calls and msg.content_type in ("tool_use", "tool_result"):
+        if not config.show_tool_calls and msg.content_type in (
+            "tool_use",
+            "tool_result",
+        ):
             continue
 
         parts = build_response_parts(
