@@ -15,10 +15,14 @@ Provides background polling of terminal status lines for all active users:
     the auto-topic mirror (mirror.py) is disabled. When the mirror is
     enabled it owns this job (also deletes the now-orphaned forum topic,
     which this fallback path cannot do) — see mirror.py's module docstring.
+  - While a window is "working" (spinner status line visible), sustains a
+    Telegram typing indicator in its bound topic — re-fired every
+    TYPING_ACTION_INTERVAL since Telegram auto-expires it after ~5s.
 
 Key components:
   - STATUS_POLL_INTERVAL: Polling frequency (1 second)
   - TOPIC_CHECK_INTERVAL: Topic existence probe frequency (60 seconds)
+  - TYPING_ACTION_INTERVAL: Typing-indicator re-fire cadence (4 seconds)
   - status_poll_loop: Background polling task
   - update_status_message: Poll and enqueue status updates
 """
@@ -28,6 +32,7 @@ import logging
 import time
 
 from telegram import Bot
+from telegram.constants import ChatAction
 from telegram.error import BadRequest
 
 from ..config import config
@@ -54,6 +59,35 @@ STATUS_POLL_INTERVAL = 1.0  # seconds - faster response (rate limiting at send l
 
 # Topic existence probe interval
 TOPIC_CHECK_INTERVAL = 60.0  # seconds
+
+# Typing-indicator re-fire cadence — Telegram auto-expires "typing" after ~5s,
+# so re-send well before that while a window is working.
+TYPING_ACTION_INTERVAL = 4.0  # seconds
+
+# Last time a typing action was sent per bound topic: (user_id, thread_id) ->
+# time.monotonic(). Popped on unbind below; a few stray entries from topics
+# closed via other cleanup paths (bot.py, mirror.py) are harmless floats.
+# ponytail: no cross-module wiring into cleanup.clear_topic_state — would
+# create a status_polling<->cleanup circular import for one float per topic.
+_last_typing_sent: dict[tuple[int, int], float] = {}
+
+
+async def _maybe_send_typing(bot: Bot, user_id: int, thread_id: int) -> None:
+    """Sustain Telegram's typing indicator while a window is working, capped
+    to one send per topic per TYPING_ACTION_INTERVAL."""
+    key = (user_id, thread_id)
+    now = time.monotonic()
+    if now - _last_typing_sent.get(key, 0.0) < TYPING_ACTION_INTERVAL:
+        return
+    _last_typing_sent[key] = now
+    try:
+        await bot.send_chat_action(
+            chat_id=session_manager.resolve_chat_id(user_id, thread_id),
+            message_thread_id=thread_id,
+            action=ChatAction.TYPING,
+        )
+    except Exception as e:
+        logger.debug("Typing indicator failed for thread %d: %s", thread_id, e)
 
 
 async def update_status_message(
@@ -126,11 +160,16 @@ async def update_status_message(
         if get_fallback_msg_id(user_id, thread_id) is not None:
             await clear_fallback_msg(user_id, bot, thread_id)
 
+    status_line = parse_status_line(pane_text)
+
+    # Typing indicator tracks "working" independent of skip_status — a busy
+    # message queue shouldn't stop the user from seeing Claude is thinking.
+    if status_line and thread_id is not None:
+        await _maybe_send_typing(bot, user_id, thread_id)
+
     # Normal status line check — skip if queue is non-empty
     if skip_status:
         return
-
-    status_line = parse_status_line(pane_text)
 
     if status_line:
         await enqueue_status_update(
@@ -169,6 +208,7 @@ async def status_poll_loop(bot: Bot) -> None:
                                 await tmux_manager.kill_window(w.window_id)
                             session_manager.unbind_thread(user_id, thread_id)
                             await clear_topic_state(user_id, thread_id, bot)
+                            _last_typing_sent.pop((user_id, thread_id), None)
                             logger.info(
                                 "Topic deleted: killed window_id '%s' and "
                                 "unbound thread %d for user %d",
@@ -201,6 +241,7 @@ async def status_poll_loop(bot: Bot) -> None:
                             # user to close manually).
                             session_manager.unbind_thread(user_id, thread_id)
                             await clear_topic_state(user_id, thread_id, bot)
+                            _last_typing_sent.pop((user_id, thread_id), None)
                             logger.info(
                                 "Cleaned up stale binding: user=%d thread=%d window_id=%s",
                                 user_id,

@@ -599,12 +599,33 @@ FALLBACK_MAX_CHARS = 250
 SUMMARY_CLI_BIN = "/Users/mogaeduard/.local/bin/claude"
 SUMMARY_MODEL = "claude-haiku-4-5-20251001"
 SUMMARY_TIMEOUT_S = 45.0
+_LANGUAGE_NAMES = {"ro": "Romanian", "en": "English"}
 SUMMARY_PROMPT = (
     "Summarize the following assistant answer in 1-3 short spoken-style "
-    "sentences, in the SAME language as the answer (Romanian stays "
-    "Romanian, English stays English). No markdown, no emoji, no preamble "
-    "— just the sentences. ANSWER: {text}"
+    "sentences. Respond ONLY in {language_name} — translate any "
+    "foreign-language fragments into {language_name} too. No markdown, no "
+    "emoji, no preamble — just the sentences. ANSWER: {text}"
 )
+
+# Romanian diacritics (both comma-below and legacy cedilla forms) and a
+# closed set of very common Romanian stopwords, matched as whole words.
+_RO_DIACRITICS = frozenset("ăâîșțĂÂÎȘȚşţŞŢ")
+_RO_STOPWORDS = {"și", "este", "pentru", "să", "mai", "nu", "cu", "de", "la", "un", "o"}
+_RO_STOPWORD_RE = re.compile(r"\b(" + "|".join(_RO_STOPWORDS) + r")\b", re.IGNORECASE)
+
+
+def detect_language_ro_en(text: str) -> str:
+    """Detect Romanian vs English for /speak's TTS language hint.
+
+    Romanian if the text has any Romanian diacritic or a whole-word
+    Romanian stopword match; English otherwise. Used to tell both the
+    Haiku summarizer and the TTS server which language to speak in,
+    instead of leaving either to re-guess."""
+    if any(ch in _RO_DIACRITICS for ch in text):
+        return "ro"
+    if _RO_STOPWORD_RE.search(text):
+        return "ro"
+    return "en"
 
 
 def last_assistant_text(messages: list[dict]) -> str | None:
@@ -645,12 +666,14 @@ def _is_valid_summary(summary: str) -> bool:
     return bool(stripped) and len(stripped) <= SUMMARY_MAX_CHARS
 
 
-async def _summarize_via_claude_cli(text: str) -> str | None:
+async def _summarize_via_claude_cli(text: str, language: str = "en") -> str | None:
     """Shell out to the Claude CLI headlessly for a 1-3 sentence
-    spoken-style summary. --settings disableAllHooks is required so the
+    spoken-style summary in the given language ("ro"/"en" — see
+    detect_language_ro_en). --settings disableAllHooks is required so the
     user's own Stop-hook pager doesn't fire a DM for this internal call.
     Returns None on any failure (binary missing, timeout, non-zero exit) —
     the caller falls back to extractive_fallback."""
+    language_name = _LANGUAGE_NAMES.get(language, "English")
     try:
         proc = await asyncio.create_subprocess_exec(
             SUMMARY_CLI_BIN,
@@ -659,7 +682,7 @@ async def _summarize_via_claude_cli(text: str) -> str | None:
             SUMMARY_MODEL,
             "--settings",
             '{"disableAllHooks":true}',
-            SUMMARY_PROMPT.format(text=text),
+            SUMMARY_PROMPT.format(language_name=language_name, text=text),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -691,11 +714,12 @@ async def _summarize_via_claude_cli(text: str) -> str | None:
     return stdout.decode("utf-8", errors="replace").strip()
 
 
-async def summarize_for_speech(text: str) -> str:
-    """1-3 sentence spoken-style summary of `text` for /speak — the Claude
-    CLI when it produces something valid, otherwise a naive extractive
-    fallback. Only meant to be called when should_summarize(text) is True."""
-    summary = await _summarize_via_claude_cli(text)
+async def summarize_for_speech(text: str, language: str = "en") -> str:
+    """1-3 sentence spoken-style summary of `text` for /speak, in the given
+    language — the Claude CLI when it produces something valid, otherwise a
+    naive extractive fallback. Only meant to be called when
+    should_summarize(text) is True."""
+    summary = await _summarize_via_claude_cli(text, language)
     if summary is not None and _is_valid_summary(summary):
         return summary.strip()
     return extractive_fallback(text)
@@ -725,6 +749,11 @@ async def speak_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await safe_reply(update.message, "🔇 Nothing to speak yet in this terminal.")
         return
 
+    # Detect on the raw answer, before summarizing shortens/paraphrases it —
+    # both the summarizer and the TTS server are then told the language
+    # explicitly instead of re-guessing.
+    language = detect_language_ro_en(text)
+
     try:
         await update.message.chat.send_action(
             ChatAction.RECORD_VOICE, message_thread_id=thread_id
@@ -733,14 +762,16 @@ async def speak_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         pass
 
     if should_summarize(text):
-        text = await summarize_for_speech(text)
+        text = await summarize_for_speech(text, language)
     if len(text) > TTS_MAX_CHARS:
         text = text[: TTS_MAX_CHARS - 1] + "…"
 
     try:
         client = httpx.AsyncClient(timeout=120.0)
         try:
-            resp = await client.post(TTS_SPEAK_URL, json={"text": text})
+            resp = await client.post(
+                TTS_SPEAK_URL, json={"text": text, "language": language}
+            )
             resp.raise_for_status()
             audio = resp.content
         finally:
@@ -2710,26 +2741,35 @@ async def post_init(application: Application) -> None:
     global session_monitor, _status_poll_task, _mirror_poll_task, _dashboard_poll_task
     global _overnight_poll_task
 
-    await application.bot.delete_my_commands()
-
     bot_commands = [
         BotCommand("start", "Show welcome message"),
         BotCommand("new", "Start Claude in <project> (anywhere in the group)"),
+        BotCommand("speak", "Voice-note summary of the last answer"),
         BotCommand("history", "Message history for this topic"),
         BotCommand("screenshot", "Terminal screenshot with control keys"),
         BotCommand("esc", "Send Escape to interrupt Claude"),
         BotCommand("kill", "Kill session and delete topic"),
         BotCommand("unbind", "Unbind topic from session (keeps window running)"),
-        BotCommand("usage", "Show Claude Code usage remaining"),
         BotCommand("dashboard", "Recreate the live terminal dashboard"),
+        BotCommand("grab", "Send a file from the terminal's cwd"),
+        BotCommand("sleep", "Arm overnight-autonomy quiet hours"),
+        BotCommand("wake", "Disarm quiet hours + morning report"),
         BotCommand("lock", "Freeze all inbound control (kill switch)"),
         BotCommand("unlock", "Release the lock"),
+        BotCommand("killall", "Panic button: kill every session"),
+        BotCommand("usage", "Show Claude Code usage remaining"),
     ]
     # Add Claude Code slash commands
     for cmd_name, desc in CC_COMMANDS.items():
         bot_commands.append(BotCommand(cmd_name, desc))
 
-    await application.bot.set_my_commands(bot_commands)
+    # Registering the command menu is cosmetic (Telegram's "/" autocomplete) —
+    # never let it block startup.
+    try:
+        await application.bot.delete_my_commands()
+        await application.bot.set_my_commands(bot_commands)
+    except Exception as e:
+        logger.warning("Failed to register bot command menu: %s", e)
 
     # Re-resolve stale window IDs from persisted state against live tmux windows
     await session_manager.resolve_stale_ids()

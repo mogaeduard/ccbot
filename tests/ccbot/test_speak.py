@@ -16,6 +16,32 @@ def _m(role: str, ctype: str, text: str) -> dict:
     return {"role": role, "content_type": ctype, "text": text, "timestamp": ""}
 
 
+class TestDetectLanguageRoEn:
+    def test_plain_english_is_en(self) -> None:
+        assert bot.detect_language_ro_en("This is a short English answer.") == "en"
+
+    def test_diacritics_are_ro(self) -> None:
+        assert bot.detect_language_ro_en("Așa funcționează.") == "ro"
+
+    def test_legacy_cedilla_diacritics_are_ro(self) -> None:
+        assert bot.detect_language_ro_en("Asa functioneaza cu şi ţ") == "ro"
+
+    def test_stopword_without_diacritics_is_ro(self) -> None:
+        assert (
+            bot.detect_language_ro_en("Acesta este un raspuns fara diacritice") == "ro"
+        )
+
+    def test_stopword_is_whole_word_only(self) -> None:
+        # "un" and "o" appear only as substrings here, never as whole words
+        assert bot.detect_language_ro_en("Unusual output observation") == "en"
+
+    def test_stopword_case_insensitive(self) -> None:
+        assert bot.detect_language_ro_en("NU this is not it") == "ro"
+
+    def test_empty_text_is_en(self) -> None:
+        assert bot.detect_language_ro_en("") == "en"
+
+
 class TestLastAssistantText:
     def test_picks_most_recent_assistant_text(self) -> None:
         msgs = [
