@@ -90,6 +90,10 @@ class Config:
             os.getenv("CCBOT_SHOW_USER_MESSAGES", "true").lower() != "false"
         )
 
+        # Display name used for the "👤 **Name**: <text>" Mac-typed message
+        # label (see handlers/response_builder.py).
+        self.owner_name: str = os.getenv("CCBOT_OWNER_NAME", "Eduard")
+
         # Show tool call notifications (tool_use/tool_result) in Telegram
         # When False, only text responses, thinking, and interactive prompts are sent
         self.show_tool_calls = (

@@ -5,8 +5,8 @@ Each Telegram topic maps 1:1 to a tmux window (Claude session).
 
 Core responsibilities:
   - Command handlers: /start, /history, /screenshot, /esc, /kill, /unbind,
-    /lock, /unlock, plus forwarding unknown /commands to Claude Code via
-    tmux.
+    /lock, /unlock, /sleep, /wake, /killall, /grab, plus forwarding unknown
+    /commands to Claude Code via tmux.
   - Callback query handler: directory browser, history pagination,
     interactive UI navigation, screenshot refresh.
   - Topic-based routing: each named topic binds to one tmux window.
@@ -57,6 +57,7 @@ import logging
 import shlex
 import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from telegram import (
@@ -97,6 +98,8 @@ from .handlers.callback_data import (
     CB_DIR_UP,
     CB_HISTORY_NEXT,
     CB_HISTORY_PREV,
+    CB_KILLALL_CANCEL,
+    CB_KILLALL_CONFIRM,
     CB_SESSION_CANCEL,
     CB_SESSION_NEW,
     CB_SESSION_SELECT,
@@ -408,6 +411,197 @@ async def unlock_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     session_manager.set_locked(False)
     await safe_reply(update.message, "🔓 Unlocked.")
+
+
+_DEFAULT_WAKE_HHMM = "09:15"
+
+
+def _parse_hhmm(raw: str) -> tuple[int, int] | None:
+    """Parse an 'HH:MM' string; returns None if malformed or out of range."""
+    try:
+        hh, mm = raw.split(":", 1)
+        hour, minute = int(hh), int(mm)
+    except ValueError:
+        return None
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    return hour, minute
+
+
+def _next_wake_time(hour: int, minute: int, now: datetime | None = None) -> datetime:
+    """Next occurrence of HH:MM — today if still ahead, else tomorrow."""
+    now = now or datetime.now()
+    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    return target
+
+
+async def sleep_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/sleep [HH:MM]: write a wake-time epoch to ~/.ccbot/quiet-until.
+
+    ccbot itself does not gate anything on this file — it exists purely for
+    an external pager script (out of repo scope) to read and decide whether
+    to page. No argument defaults to the next 09:15.
+    """
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+    if not update.message:
+        return
+
+    text = update.message.text or ""
+    parts = text.split(maxsplit=1)
+    raw_arg = parts[1].strip() if len(parts) > 1 else _DEFAULT_WAKE_HHMM
+    parsed = _parse_hhmm(raw_arg)
+    if parsed is None:
+        await safe_reply(
+            update.message, "❌ Invalid time, use HH:MM (e.g. /sleep 09:30)"
+        )
+        return
+
+    wake = _next_wake_time(*parsed)
+    quiet_until_file = ccbot_dir() / "quiet-until"
+    quiet_until_file.parent.mkdir(parents=True, exist_ok=True)
+    quiet_until_file.write_text(str(int(wake.timestamp())))
+
+    await safe_reply(update.message, f"😴 Quiet until {wake.strftime('%H:%M')}")
+
+
+async def wake_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/wake: cancel quiet hours by deleting ~/.ccbot/quiet-until."""
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+    if not update.message:
+        return
+
+    (ccbot_dir() / "quiet-until").unlink(missing_ok=True)
+    await safe_reply(update.message, "☀️ Awake — pings back on")
+
+
+# /killall confirmation TTL and pending state (see callback_handler's
+# CB_KILLALL_CONFIRM/CANCEL branch). Keyed by user_id -> time.monotonic()
+# of the prompt — single-user bot, but keyed defensively rather than a bare
+# global flag.
+_KILLALL_TTL_SECONDS = 60.0
+_pending_killall: dict[int, float] = {}
+
+
+async def killall_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Panic button: kill every tmux window in the ccbot session.
+
+    Destructive — requires a Kill all/Cancel confirmation tap (handled in
+    callback_handler) before anything is actually killed. Topics are left
+    alone; the mirror's next tick deletes them once their windows are gone.
+    """
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+    if not update.message:
+        return
+
+    windows = await tmux_manager.list_windows()
+    n = len(windows)
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("💀 Kill all", callback_data=CB_KILLALL_CONFIRM),
+                InlineKeyboardButton("Cancel", callback_data=CB_KILLALL_CANCEL),
+            ]
+        ]
+    )
+    await safe_reply(
+        update.message, f"⚠️ Kill all {n} terminals?", reply_markup=keyboard
+    )
+    _pending_killall[user.id] = time.monotonic()
+
+
+_GRAB_MAX_BYTES = 50 * 1024 * 1024  # Telegram bot upload limit
+
+
+def _grab_target(raw_path: str, cwd: str) -> tuple[Path | None, str | None]:
+    """Resolve /grab's <path> and run every trust-boundary guard.
+
+    <path> is resolved against the bound window's pane cwd unless it's
+    already absolute. Returns (resolved_path, None) on success, or
+    (None, reason) with a short user-facing rejection reason.
+
+    This crosses a trust boundary (Telegram user input -> local filesystem
+    read -> upload), so every guard checks the FINAL resolved path (after
+    resolve() has followed any symlinks) — not the raw input:
+      - must live under the home directory
+      - must not resolve into ~/.ccbot (holds the .env with the bot token)
+      - no path component may start with "." anywhere in the chain (blocks
+        .ssh, .aws, .env, etc., not just a top-level dotdir)
+      - must exist, must be a regular file, must be <= 50MB
+    Do not weaken these checks.
+    """
+    candidate = Path(raw_path).expanduser()
+    if not candidate.is_absolute():
+        candidate = Path(cwd) / candidate
+    resolved = candidate.resolve()
+
+    home = Path.home().resolve()
+    try:
+        rel = resolved.relative_to(home)
+    except ValueError:
+        return None, "outside home"
+
+    ccbot_state_dir = ccbot_dir().expanduser().resolve()
+    if resolved == ccbot_state_dir or ccbot_state_dir in resolved.parents:
+        return None, f"denied (ccbot config dir): {resolved}"
+
+    if any(part.startswith(".") for part in rel.parts):
+        return None, f"denied (hidden path): {resolved}"
+
+    if not resolved.exists():
+        return None, f"not found: {resolved}"
+    if not resolved.is_file():
+        return None, f"not a regular file: {resolved}"
+
+    size = resolved.stat().st_size
+    if size > _GRAB_MAX_BYTES:
+        return None, f"too large ({size / 1_048_576:.1f} MB > 50 MB): {resolved}"
+
+    return resolved, None
+
+
+async def grab_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/grab <path>: send a file from the bound window's cwd (or an absolute
+    path) into this topic as a document. See _grab_target for the security
+    guards — this reads arbitrary paths named by a Telegram message."""
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+    if not update.message:
+        return
+
+    text = update.message.text or ""
+    parts = text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await safe_reply(update.message, "Usage: /grab <path>")
+        return
+
+    thread_id = _get_thread_id(update)
+    wid = session_manager.resolve_window_for_thread(user.id, thread_id)
+    if not wid:
+        await safe_reply(update.message, "❌ No session bound to this topic.")
+        return
+
+    w = await tmux_manager.find_window_by_id(wid)
+    if not w:
+        display = session_manager.get_display_name(wid)
+        await safe_reply(update.message, f"❌ Window '{display}' no longer exists.")
+        return
+
+    resolved, reason = _grab_target(parts[1].strip(), w.cwd)
+    if reason is not None:
+        await safe_reply(update.message, f"❌ {reason}")
+        return
+
+    assert resolved is not None
+    await update.message.reply_document(document=str(resolved), filename=resolved.name)
 
 
 async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1782,6 +1976,25 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await safe_edit(query, f'🎤 → "{text}"')
         await query.answer("Sent")
 
+    elif data in (CB_KILLALL_CONFIRM, CB_KILLALL_CANCEL):
+        prompted_at = _pending_killall.pop(user.id, None)
+        if prompted_at is None or time.monotonic() - prompted_at > _KILLALL_TTL_SECONDS:
+            await safe_edit(query, "expired, run /killall again")
+            await query.answer("Expired", show_alert=True)
+            return
+        if data == CB_KILLALL_CANCEL:
+            await safe_edit(query, "cancelled")
+            await query.answer("Cancelled")
+            return
+        # Confirmed: kill every window. Do NOT touch topics here — the
+        # mirror's next tick deletes them once their windows are gone.
+        windows = await tmux_manager.list_windows()
+        n = len(windows)
+        for w in windows:
+            await tmux_manager.kill_window(w.window_id)
+        await safe_edit(query, f"💀 killed {n} terminals")
+        await query.answer("Killed")
+
     elif data == CB_DIR_CANCEL:
         pending_tid = (
             context.user_data.get("_pending_thread_id") if context.user_data else None
@@ -2446,6 +2659,10 @@ def create_bot() -> Application:
     application.add_handler(CommandHandler("dashboard", dashboard_command))
     application.add_handler(CommandHandler("lock", lock_command))
     application.add_handler(CommandHandler("unlock", unlock_command))
+    application.add_handler(CommandHandler("sleep", sleep_command))
+    application.add_handler(CommandHandler("wake", wake_command))
+    application.add_handler(CommandHandler("killall", killall_command))
+    application.add_handler(CommandHandler("grab", grab_command))
     application.add_handler(CallbackQueryHandler(callback_handler))
     # Topic created event — eagerly bind a plain-shell window
     application.add_handler(

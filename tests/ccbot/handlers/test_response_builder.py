@@ -13,6 +13,19 @@ class TestBuildResponseParts:
         assert len(parts) == 1
         assert "\U0001f464" in parts[0]
 
+    def test_user_message_label_is_bold_name(self):
+        """Mac-typed messages get a '👤 **Name**: text' label — bold name,
+        not just the bare emoji prefix (owner_name defaults to Eduard)."""
+        parts = build_response_parts("hello", is_complete=True, role="user")
+        assert parts[0] == "\U0001f464 **Eduard**: hello"
+
+    def test_user_message_label_uses_configured_owner_name(self, monkeypatch):
+        from ccbot.handlers import response_builder
+
+        monkeypatch.setattr(response_builder.config, "owner_name", "Someone")
+        parts = build_response_parts("hi", is_complete=True, role="user")
+        assert parts[0] == "\U0001f464 **Someone**: hi"
+
     def test_user_message_truncated_at_3000_chars(self):
         long_text = "a" * 4000
         parts = build_response_parts(long_text, is_complete=True, role="user")

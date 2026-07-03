@@ -10,6 +10,8 @@ Constants:
   - CB_SCREENSHOT_*: Screenshot refresh
   - CB_ASK_*: Interactive UI navigation (arrows, enter, esc)
   - CB_KEYS_PREFIX: Screenshot control keys (kb:<key_id>:<window>)
+  - CB_VOICE_*: Voice transcript confirm-first (Send/Cancel)
+  - CB_KILLALL_*: /killall panic button confirm/cancel
 """
 
 # History pagination
@@ -53,3 +55,7 @@ CB_KEYS_PREFIX = "kb:"  # kb:<key_id>:<window>
 # Voice confirm-first (transcript preview before injection)
 CB_VOICE_SEND = "vc:send"
 CB_VOICE_CANCEL = "vc:cancel"
+
+# /killall panic button (kill every tmux window) — confirm/cancel
+CB_KILLALL_CONFIRM = "ka:confirm"
+CB_KILLALL_CANCEL = "ka:cancel"

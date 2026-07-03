@@ -13,6 +13,7 @@ Key function:
   - build_response_parts: Build paginated response messages
 """
 
+from ..config import config
 from ..markdown_v2 import convert_markdown_tables
 from ..telegram_sender import split_message
 from ..transcript_parser import TranscriptParser
@@ -32,9 +33,12 @@ def build_response_parts(
     """
     text = text.strip()
 
-    # User messages: add emoji prefix (no newline)
+    # User messages: bold name label (real "**...**" markdown, not manually
+    # escaped MarkdownV2 — it's converted at the send layer like everything
+    # else, so it survives convert_markdown and degrades harmlessly to
+    # plain "**Name**" text on the strip_sentinels plain-text fallback path).
     if role == "user":
-        prefix = "👤 "
+        prefix = f"👤 **{config.owner_name}**: "
         separator = ""
         # User messages are typically short, no special processing needed
         if len(text) > 3000:
