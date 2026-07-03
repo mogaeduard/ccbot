@@ -52,11 +52,14 @@ async def _create_topics(bot: Bot, mirror_chat_id: int) -> None:
     for w in windows:
         if w.window_id in bound_window_ids:
             continue
-        state = session_manager.get_window_state(w.window_id)
-        if not state.session_id:
-            continue  # plain-shell window, no Claude session yet — no topic
 
+        # Every window gets a topic — including plain shells with no Claude
+        # session yet, so each numbered terminal has a standing chat you can
+        # type cc/cc-new/cc-resume into (Termius-style). Number-first naming
+        # keeps topics identifiable as Terminal N.
         name = w.window_name or (Path(w.cwd).name if w.cwd else "") or w.window_id
+        if w.window_index:
+            name = f"{w.window_index} — {name}"
         try:
             topic = await bot.create_forum_topic(chat_id=mirror_chat_id, name=name)
         except TelegramError as e:

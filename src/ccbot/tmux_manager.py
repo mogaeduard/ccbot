@@ -33,6 +33,7 @@ class TmuxWindow:
     window_name: str
     cwd: str  # Current working directory
     pane_current_command: str = ""  # Process running in active pane
+    window_index: str = ""  # Stable window number (Terminal N)
 
 
 class TmuxManager:
@@ -128,6 +129,7 @@ class TmuxManager:
                             window_name=name,
                             cwd=cwd,
                             pane_current_command=pane_cmd,
+                            window_index=window.window_index or "",
                         )
                     )
                 except Exception as e:

@@ -45,9 +45,17 @@ def _mirror_chat_id(monkeypatch):
 
 
 def _window(
-    window_id: str = "@0", window_name: str = "proj", cwd: str = "/tmp/proj"
+    window_id: str = "@0",
+    window_name: str = "proj",
+    cwd: str = "/tmp/proj",
+    window_index: str = "",
 ) -> TmuxWindow:
-    return TmuxWindow(window_id=window_id, window_name=window_name, cwd=cwd)
+    return TmuxWindow(
+        window_id=window_id,
+        window_name=window_name,
+        cwd=cwd,
+        window_index=window_index,
+    )
 
 
 class TestMirrorUserId:
@@ -107,8 +115,11 @@ class TestCreateTopics:
         )
 
     @pytest.mark.asyncio
-    async def test_skips_plain_shell_window(self, monkeypatch, mgr, bot) -> None:
-        """A window with no tracked Claude session gets no topic."""
+    async def test_creates_topic_for_plain_shell_window(
+        self, monkeypatch, mgr, bot
+    ) -> None:
+        """Plain-shell windows (no Claude session yet) get a standing topic
+        too, so every numbered terminal has a chat to type cc/cc-new into."""
         w = _window(window_id="@0")
         monkeypatch.setattr(
             mirror.tmux_manager, "list_windows", AsyncMock(return_value=[w])
@@ -117,7 +128,23 @@ class TestCreateTopics:
 
         await mirror.mirror_tick(bot)
 
-        bot.create_forum_topic.assert_not_called()
+        bot.create_forum_topic.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_topic_name_prefixed_with_window_index(
+        self, monkeypatch, mgr, bot
+    ) -> None:
+        """Topics are named 'N — name' when the window index is known."""
+        w = _window(window_id="@0", window_name="api", window_index="2")
+        monkeypatch.setattr(
+            mirror.tmux_manager, "list_windows", AsyncMock(return_value=[w])
+        )
+
+        await mirror.mirror_tick(bot)
+
+        bot.create_forum_topic.assert_awaited_once_with(
+            chat_id=config.mirror_chat_id, name="2 — api"
+        )
 
     @pytest.mark.asyncio
     async def test_skips_already_bound_window(self, monkeypatch, mgr, bot) -> None:
