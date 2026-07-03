@@ -193,6 +193,11 @@ def hook_main() -> None:
         logger.warning("TMUX_PANE not set, cannot determine window")
         return
 
+    # #{session_name} would report the grouped VIEW session (e.g.
+    # "view-123-456") when Claude is launched from a terminal tab attached
+    # via a tmux session group — but the monitor matches keys against the
+    # BASE session name. #{session_group} equals the base session's name for
+    # grouped sessions, so prefer it whenever the session is grouped.
     result = subprocess.run(
         [
             "tmux",
@@ -200,7 +205,8 @@ def hook_main() -> None:
             "-t",
             pane_id,
             "-p",
-            "#{session_name}:#{window_id}:#{window_name}",
+            "#{?session_grouped,#{session_group},#{session_name}}"
+            ":#{window_id}:#{window_name}",
         ],
         capture_output=True,
         text=True,

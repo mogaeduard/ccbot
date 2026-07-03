@@ -391,8 +391,10 @@ class TmuxManager:
         if not path.is_dir():
             return False, f"Not a directory: {work_dir}", "", ""
 
-        # Create window name, adding suffix if name already exists
-        final_window_name = window_name if window_name else path.name
+        # Create window name, adding suffix if name already exists.
+        # path.name is empty at filesystem root ("/") — tmux rejects an empty
+        # window name, so fall back to a constant.
+        final_window_name = window_name or path.name or "term"
 
         # Check for existing window name
         base_name = final_window_name
