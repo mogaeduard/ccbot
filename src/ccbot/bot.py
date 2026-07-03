@@ -89,6 +89,8 @@ from .handlers.callback_data import (
     CB_WIN_BIND,
     CB_WIN_CANCEL,
     CB_WIN_NEW,
+    CB_VOICE_CANCEL,
+    CB_VOICE_SEND,
 )
 from .handlers.directory_browser import (
     BROWSE_DIRS_KEY,
@@ -788,19 +790,26 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await safe_reply(update.message, f"⚠ Transcription failed: {e}")
         return
 
-    try:
-        await update.message.chat.send_action(ChatAction.TYPING)
-    except Exception as e:
-        logger.warning("send_action(TYPING) failed, continuing to injection: %s", e)
-    clear_status_msg_info(user.id, thread_id)
+    # Confirm-first: show the transcript with Send/Cancel instead of
+    # injecting straight away — an ASR slip must never become a command.
+    _pending_voice[(user.id, thread_id)] = text
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✅ Send", callback_data=CB_VOICE_SEND),
+                InlineKeyboardButton("❌ Cancel", callback_data=CB_VOICE_CANCEL),
+            ]
+        ]
+    )
+    await update.message.reply_text(
+        f'🎤 "{text}"',
+        reply_markup=keyboard,
+        message_thread_id=thread_id,
+    )
 
-    success, message = await session_manager.send_to_window(wid, text)
-    if not success:
-        await safe_reply(update.message, f"❌ {message}")
-        return
 
-    await safe_reply(update.message, f'🎤 "{text}"')
-
+# Pending voice transcripts awaiting Send/Cancel: (user_id, thread_id) → text
+_pending_voice: dict[tuple[int, int], str] = {}
 
 # Active bash capture tasks: (user_id, thread_id) → asyncio.Task
 _bash_capture_tasks: dict[tuple[int, int], asyncio.Task[None]] = {}
@@ -1486,6 +1495,35 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await _create_and_bind_window(
             query, context, user, selected_path, pending_thread_id
         )
+
+    elif data in (CB_VOICE_SEND, CB_VOICE_CANCEL):
+        tid = _get_thread_id(update)
+        if tid is None:
+            await query.answer("Not in a topic", show_alert=True)
+            return
+        text = _pending_voice.pop((user.id, tid), None)
+        if data == CB_VOICE_CANCEL:
+            await safe_edit(query, "🎤 Cancelled")
+            await query.answer("Cancelled")
+            return
+        if text is None:
+            await query.answer(
+                "Nothing pending (already sent or expired)", show_alert=True
+            )
+            return
+        wid = session_manager.get_window_for_thread(user.id, tid)
+        if wid is None:
+            await safe_edit(query, "❌ No terminal bound to this topic anymore")
+            await query.answer("No terminal")
+            return
+        clear_status_msg_info(user.id, tid)
+        send_ok, send_msg = await session_manager.send_to_window(wid, text)
+        if not send_ok:
+            await safe_edit(query, f"❌ {send_msg}")
+            await query.answer("Failed")
+            return
+        await safe_edit(query, f'🎤 → "{text}"')
+        await query.answer("Sent")
 
     elif data == CB_DIR_CANCEL:
         pending_tid = (

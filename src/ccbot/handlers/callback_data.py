@@ -49,3 +49,7 @@ CB_SESSION_CANCEL = "rs:cancel"  # cancel
 
 # Screenshot control keys
 CB_KEYS_PREFIX = "kb:"  # kb:<key_id>:<window>
+
+# Voice confirm-first (transcript preview before injection)
+CB_VOICE_SEND = "vc:send"
+CB_VOICE_CANCEL = "vc:cancel"
