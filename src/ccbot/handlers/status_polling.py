@@ -8,6 +8,10 @@ Provides background polling of terminal status lines for all active users:
   - Periodically probes topic existence via unpin_all_forum_topic_messages
     (silent no-op when no pins); cleans up deleted topics (kills tmux window
     + unbinds thread)
+  - Dead-window (window gone, binding stale) cleanup: only runs here when
+    the auto-topic mirror (mirror.py) is disabled. When the mirror is
+    enabled it owns this job (also deletes the now-orphaned forum topic,
+    which this fallback path cannot do) — see mirror.py's module docstring.
 
 Key components:
   - STATUS_POLL_INTERVAL: Polling frequency (1 second)
@@ -23,6 +27,7 @@ import time
 from telegram import Bot
 from telegram.error import BadRequest
 
+from ..config import config
 from ..session import session_manager
 from ..terminal_parser import is_interactive_ui, parse_status_line
 from ..tmux_manager import tmux_manager
@@ -170,14 +175,19 @@ async def status_poll_loop(bot: Bot) -> None:
                     # Clean up stale bindings (window no longer exists)
                     w = await tmux_manager.find_window_by_id(wid)
                     if not w:
-                        session_manager.unbind_thread(user_id, thread_id)
-                        await clear_topic_state(user_id, thread_id, bot)
-                        logger.info(
-                            "Cleaned up stale binding: user=%d thread=%d window_id=%s",
-                            user_id,
-                            thread_id,
-                            wid,
-                        )
+                        if not config.mirror_chat_id:
+                            # No mirror running to own dead-window cleanup —
+                            # fall back to the pre-mirror behavior (unbind +
+                            # clear state; the topic itself is left for the
+                            # user to close manually).
+                            session_manager.unbind_thread(user_id, thread_id)
+                            await clear_topic_state(user_id, thread_id, bot)
+                            logger.info(
+                                "Cleaned up stale binding: user=%d thread=%d window_id=%s",
+                                user_id,
+                                thread_id,
+                                wid,
+                            )
                         continue
 
                     # UI detection happens unconditionally in update_status_message.

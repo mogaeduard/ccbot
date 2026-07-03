@@ -3,6 +3,7 @@
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from telegram.error import BadRequest
 
 from ccbot.handlers.interactive_ui import (
     _build_interactive_keyboard,
@@ -91,6 +92,39 @@ class TestHandleInteractiveUI:
 
         assert result is False
         mock_bot.send_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_deleted_thread_triggers_cleanup_not_error_log(
+        self, mock_bot: AsyncMock, sample_pane_settings: str
+    ):
+        """A deleted-topic send failure hands off to cleanup_deleted_thread
+        (change 2) instead of just logging — this is the one send call site
+        that bypasses message_sender.py's safe_* helpers (plain-text UI)."""
+        window_id = "@5"
+        mock_window = MagicMock()
+        mock_window.window_id = window_id
+        mock_bot.send_message = AsyncMock(
+            side_effect=BadRequest("Bad Request: message thread not found")
+        )
+
+        with (
+            patch("ccbot.handlers.interactive_ui.tmux_manager") as mock_tmux,
+            patch("ccbot.handlers.interactive_ui.session_manager") as mock_sm,
+            patch(
+                "ccbot.handlers.interactive_ui.cleanup_deleted_thread",
+                new_callable=AsyncMock,
+            ) as mock_cleanup,
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_tmux.capture_pane = AsyncMock(return_value=sample_pane_settings)
+            mock_sm.resolve_chat_id.return_value = -100999
+
+            result = await handle_interactive_ui(
+                mock_bot, user_id=1, window_id=window_id, thread_id=42
+            )
+
+        assert result is False
+        mock_cleanup.assert_awaited_once_with(-100999, 42)
 
 
 class TestKeyboardLayoutForSettings:

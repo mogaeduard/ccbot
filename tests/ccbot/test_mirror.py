@@ -194,19 +194,29 @@ class TestCloseDeadTopics:
         cleanup_mock.assert_awaited_once_with(user_id, 42, bot)
 
     @pytest.mark.asyncio
-    async def test_leaves_non_mirror_binding_alone(self, monkeypatch, mgr, bot) -> None:
-        """A binding not owned by the mirror (no matching group_chat_id) is
-        left for the normal status_poll_loop cleanup — mirror never touches it.
+    async def test_closes_phone_created_binding_too(
+        self, monkeypatch, mgr, bot
+    ) -> None:
+        """A binding with no group_chat_id tag (e.g. bound before any message
+        set one) is treated the same as a mirror-created one: this deployment
+        keeps every topic in the single mirror_chat_id forum group, so the
+        tmux-windows-set and bound-topics-set must stay identical regardless
+        of which flow created the binding.
         """
         mgr.bind_thread(100, 7, "@0", window_name="proj")  # no set_group_chat_id
         monkeypatch.setattr(
             mirror.tmux_manager, "list_windows", AsyncMock(return_value=[])
         )
+        cleanup_mock = AsyncMock()
+        monkeypatch.setattr(mirror, "clear_topic_state", cleanup_mock)
+
         await mirror.mirror_tick(bot)
 
-        bot.delete_forum_topic.assert_not_called()
-        # Binding untouched
-        assert mgr.get_window_for_thread(100, 7) == "@0"
+        bot.delete_forum_topic.assert_awaited_once_with(
+            chat_id=config.mirror_chat_id, message_thread_id=7
+        )
+        assert mgr.get_window_for_thread(100, 7) is None
+        cleanup_mock.assert_awaited_once_with(100, 7, bot)
 
     @pytest.mark.asyncio
     async def test_leaves_live_window_bindings_alone(

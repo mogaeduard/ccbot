@@ -9,15 +9,16 @@ cadence):
     created and bound via SessionManager.bind_thread, persisted in state.json
     exactly like any other topic-created session. Plain-shell windows with no
     session yet get no topic.
-  - Bindings this module created whose tmux window has since disappeared
-    (tab closed) get their forum topic closed, a one-line "terminal ended"
-    notice posted, and the binding cleaned up via the same
+  - ANY binding (mirror-created or bound through the phone/Mac directory
+    browser flow — see bot.py) whose tmux window has since disappeared gets
+    its forum topic deleted and the binding cleaned up via the same
     unbind_thread/clear_topic_state path bot.py's topic_closed_handler uses.
-
-Mirror-owned bindings are identified via SessionManager.group_chat_ids: any
-binding whose stored chat_id equals config.mirror_chat_id was created here,
-so cleanup never touches phone- or Mac-bound topics created through the
-normal directory-browser flow.
+    Deployment invariant: all topics live in one forum group
+    (config.mirror_chat_id), so "every dead window" and "every mirror-owned
+    dead window" are the same set here — there is no separate non-mirror
+    binding to spare. status_polling.py's own dead-binding cleanup steps
+    aside (skips itself) whenever this mirror is enabled, so it stays the
+    single owner of this job.
 
 Key function: mirror_tick(bot).
 """
@@ -82,15 +83,18 @@ async def _create_topics(bot: Bot, mirror_chat_id: int) -> None:
 
 
 async def _close_dead_topics(bot: Bot, mirror_chat_id: int) -> None:
-    """Close mirror-owned topics whose bound window has disappeared."""
+    """Delete the topic for every binding whose tmux window has disappeared.
+
+    Covers all bindings, not just mirror-created ones: this deployment keeps
+    every topic in the single mirror_chat_id forum group, so a phone-bound
+    topic whose window died must vanish exactly like a mirror-created one —
+    the tmux-windows-set and bound-topics-set must stay identical.
+    """
     live_ids = {w.window_id for w in await tmux_manager.list_windows()}
 
     for user_id, thread_id, window_id in list(session_manager.iter_thread_bindings()):
         if window_id in live_ids:
             continue
-        key = f"{user_id}:{thread_id}"
-        if session_manager.group_chat_ids.get(key) != mirror_chat_id:
-            continue  # not a mirror-owned binding — leave to normal cleanup
 
         # Delete (not close) the topic: a closetab'd/X-closed terminal should
         # vanish from Telegram entirely, mirroring `tabs` on the Mac.

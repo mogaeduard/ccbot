@@ -33,7 +33,11 @@ from .callback_data import (
     CB_ASK_TAB,
     CB_ASK_UP,
 )
-from .message_sender import NO_LINK_PREVIEW
+from .message_sender import (
+    NO_LINK_PREVIEW,
+    cleanup_deleted_thread,
+    is_thread_deleted_error,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -235,7 +239,10 @@ async def handle_interactive_ui(
             **thread_kwargs,  # type: ignore[arg-type]
         )
     except Exception as e:
-        logger.error("Failed to send interactive UI: %s", e)
+        if thread_id is not None and is_thread_deleted_error(e):
+            await cleanup_deleted_thread(chat_id, thread_id)
+        else:
+            logger.error("Failed to send interactive UI: %s", e)
         return False
     if sent:
         _interactive_msgs[ikey] = sent.message_id

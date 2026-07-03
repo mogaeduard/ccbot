@@ -14,6 +14,11 @@ Core responsibilities:
     to Claude Code as file paths (photo_handler).
   - Voice handling: voice messages are transcribed via OpenAI API and
     forwarded as text (voice_handler).
+  - Phone-created topics: a new forum topic immediately gets a bound
+    plain-shell tmux window (topic_created_handler), so the terminal
+    exists before the user picks a project — the directory browser and
+    session picker then drive that same window instead of spawning a
+    second one (see _create_and_bind_window's reuse path).
   - Automatic cleanup: closing a topic kills the associated window
     (topic_closed_handler). Unsupported content (stickers, etc.)
     is rejected with a warning (unsupported_content_handler).
@@ -35,6 +40,7 @@ Key functions: create_bot(), handle_new_message().
 import asyncio
 import io
 import logging
+import shlex
 import time
 from pathlib import Path
 
@@ -129,7 +135,7 @@ from .handlers.message_sender import (
     send_with_fallback,
 )
 from .markdown_v2 import convert_markdown
-from .mirror import mirror_poll_loop
+from .mirror import mirror_poll_loop, mirror_tick
 from .handlers.response_builder import build_response_parts
 from .handlers.status_polling import status_poll_loop
 from .screenshot import text_to_image
@@ -405,6 +411,80 @@ def _build_screenshot_keyboard(window_id: str) -> InlineKeyboardMarkup:
                 )
             ],
         ]
+    )
+
+
+async def topic_created_handler(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Handle a new forum topic — bind a plain-shell window immediately.
+
+    Telegram gives no event for topic *deletion* (see message_sender.py's
+    deleted-thread detection), so ccbot can't afford to wait for the user's
+    first text message to react to topic *creation* either — a terminal
+    must exist as soon as the topic does, keeping the tmux-windows-set and
+    bound-topics-set identical at every mirror tick. The directory browser
+    is then posted as the first message so the user can still pick a
+    project or resume a session; its callback handlers drive the same
+    window instead of creating a second one (see _create_and_bind_window).
+
+    This fires for EVERY forum_topic_created service message, including
+    ones create_forum_topic() itself generates for mirror-created topics
+    (mirror.py) — those are already bound synchronously by the mirror
+    before this update is even delivered, so bail out early rather than
+    create a redundant second shell window and steal the binding.
+    """
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+
+    msg = update.message
+    if not msg or not msg.forum_topic_created:
+        return
+
+    thread_id = _get_thread_id(update)
+    if thread_id is None:
+        return
+
+    if session_manager.get_window_for_thread(user.id, thread_id) is not None:
+        return  # already bound (e.g. mirror-created topic) — nothing to do
+
+    chat = update.effective_chat
+    if chat and chat.type in ("group", "supergroup"):
+        session_manager.set_group_chat_id(user.id, thread_id, chat.id)
+
+    topic_name = msg.forum_topic_created.name
+    success, message, wname, wid = await tmux_manager.create_window(
+        str(Path.home()), window_name=topic_name, start_claude=False
+    )
+    if not success:
+        logger.error("Topic created: failed to create shell window: %s", message)
+        await safe_reply(msg, f"⚠ Failed to create terminal: {message}")
+        return
+
+    session_manager.bind_thread(user.id, thread_id, wid, window_name=wname)
+    logger.info(
+        "Topic created (phone): bound shell window %s ('%s') to thread %d",
+        wid,
+        wname,
+        thread_id,
+    )
+
+    w = await tmux_manager.find_window_by_id(wid)
+    label = f"terminal {w.window_index}" if w and w.window_index else f"'{wname}'"
+    start_path = str(Path.cwd())
+    browser_text, keyboard, subdirs = build_directory_browser(start_path)
+    if context.user_data is not None:
+        context.user_data[STATE_KEY] = STATE_BROWSING_DIRECTORY
+        context.user_data[BROWSE_PATH_KEY] = start_path
+        context.user_data[BROWSE_PAGE_KEY] = 0
+        context.user_data[BROWSE_DIRS_KEY] = subdirs
+        context.user_data["_pending_thread_id"] = thread_id
+    await safe_reply(
+        msg,
+        f"🖥 {label} is live — pick a project to start Claude, or just type\n\n"
+        + browser_text,
+        reply_markup=keyboard,
     )
 
 
@@ -1041,24 +1121,68 @@ async def _create_and_bind_window(
     """Create a tmux window, bind it to a topic, and forward pending text.
 
     Shared by CB_DIR_CONFIRM (no sessions), CB_SESSION_NEW, and CB_SESSION_SELECT.
+
+    Reuse path: if the topic is already bound to a plain-shell window (bound
+    eagerly by topic_created_handler when the topic itself was created — see
+    bot.py's module docstring), drive Claude into that window instead of
+    spawning a second one. Otherwise a shell window would be left running,
+    bound to nothing, and never cleaned up (nothing kills it: it has no
+    session, so mirror.py's dead-window sweep never even considers it dead).
     """
     from telegram import CallbackQuery, User
 
     assert isinstance(query, CallbackQuery)
     assert isinstance(user, User)
 
-    success, message, created_wname, created_wid = await tmux_manager.create_window(
-        selected_path, resume_session_id=resume_session_id
-    )
+    reuse_wid: str | None = None
+    if pending_thread_id is not None:
+        bound_wid = session_manager.get_window_for_thread(user.id, pending_thread_id)
+        if bound_wid and not session_manager.get_window_state(bound_wid).session_id:
+            reuse_wid = bound_wid
+
+    if reuse_wid:
+        cmd = config.claude_command
+        if resume_session_id:
+            cmd = f"{cmd} --resume {resume_session_id}"
+        created_wname = session_manager.get_display_name(reuse_wid)
+        send_ok, send_msg = await session_manager.send_to_window(
+            reuse_wid, f"cd {shlex.quote(selected_path)} && {cmd}"
+        )
+        if send_ok:
+            success = True
+            created_wid = reuse_wid
+            message = f"Started Claude in '{created_wname}' at {selected_path}"
+        else:
+            # Bound window vanished between eager-bind and here — fall back
+            # to creating a fresh one, same as the non-reuse path.
+            logger.warning(
+                "Reuse target %s gone (%s), creating a new window instead",
+                reuse_wid,
+                send_msg,
+            )
+            (
+                success,
+                message,
+                created_wname,
+                created_wid,
+            ) = await tmux_manager.create_window(
+                selected_path, resume_session_id=resume_session_id
+            )
+    else:
+        success, message, created_wname, created_wid = await tmux_manager.create_window(
+            selected_path, resume_session_id=resume_session_id
+        )
+
     if success:
         logger.info(
-            "Window created: %s (id=%s) at %s (user=%d, thread=%s, resume=%s)",
+            "Window ready: %s (id=%s) at %s (user=%d, thread=%s, resume=%s, reused=%s)",
             created_wname,
             created_wid,
             selected_path,
             user.id,
             pending_thread_id,
             resume_session_id,
+            bool(reuse_wid),
         )
         # Wait for Claude Code's SessionStart hook to register in session_map.
         # Resume sessions take longer to start (loading session state), so use
@@ -1103,7 +1227,10 @@ async def _create_and_bind_window(
                 user.id, pending_thread_id, created_wid, window_name=created_wname
             )
 
-            status = "Resumed" if resume_session_id else "Created"
+            if resume_session_id:
+                status = "Resumed"
+            else:
+                status = "Started" if reuse_wid else "Created"
             await safe_edit(
                 query,
                 f"✅ {message}\n\n{status}. Send messages here.",
@@ -1910,9 +2037,15 @@ async def post_init(application: Application) -> None:
     _status_poll_task = asyncio.create_task(status_poll_loop(application.bot))
     logger.info("Status polling task started")
 
-    # Start auto-topic mirror polling task (no-op loop if config.mirror_chat_id
-    # is unset, so only bother starting it when the feature is enabled)
+    # Auto-topic mirror: converge drift accumulated while the daemon was down
+    # (dead windows' topics deleted, live unbound windows get topics) with one
+    # synchronous pass *before* the bot starts processing updates — relying on
+    # the poll loop's first iteration would race incoming updates against a
+    # not-yet-reconciled state. resolve_stale_ids() above already ran, so
+    # window IDs are current even if the tmux server itself was restarted.
+    # No-op when config.mirror_chat_id is unset, so only bother when enabled.
     if config.mirror_chat_id:
+        await mirror_tick(application.bot)
         _mirror_poll_task = asyncio.create_task(mirror_poll_loop(application.bot))
         logger.info("Mirror polling task started (chat_id=%d)", config.mirror_chat_id)
 
@@ -1967,6 +2100,13 @@ def create_bot() -> Application:
     application.add_handler(CommandHandler("unbind", unbind_command))
     application.add_handler(CommandHandler("usage", usage_command))
     application.add_handler(CallbackQueryHandler(callback_handler))
+    # Topic created event — eagerly bind a plain-shell window
+    application.add_handler(
+        MessageHandler(
+            filters.StatusUpdate.FORUM_TOPIC_CREATED,
+            topic_created_handler,
+        )
+    )
     # Topic closed event — auto-kill associated window
     application.add_handler(
         MessageHandler(

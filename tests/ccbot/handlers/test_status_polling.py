@@ -5,11 +5,16 @@ model picker renders in the terminal, and the status poller detects it
 on its next 1s tick.
 """
 
+import asyncio
+import contextlib
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from ccbot.config import config
+from ccbot.handlers import status_polling
 from ccbot.handlers.status_polling import update_status_message
+from ccbot.session import SessionManager
 
 
 @pytest.fixture
@@ -139,3 +144,71 @@ class TestStatusPollerSettingsDetection:
             assert keyboard is not None
             # Verify the message text contains model picker content
             assert "Select model" in call_kwargs["text"]
+
+
+@pytest.fixture
+def mgr(monkeypatch) -> SessionManager:
+    """Fresh SessionManager swapped into status_polling's module namespace,
+    mirroring the pattern in test_mirror.py — real bind/unbind behavior
+    without touching real state.json."""
+    monkeypatch.setattr(SessionManager, "_load_state", lambda self: None)
+    monkeypatch.setattr(SessionManager, "_save_state", lambda self: None)
+    m = SessionManager()
+    monkeypatch.setattr(status_polling, "session_manager", m)
+    return m
+
+
+async def _run_one_tick(bot: AsyncMock) -> None:
+    """Run status_poll_loop just long enough for one full pass, then stop it."""
+    task = asyncio.create_task(status_polling.status_poll_loop(bot))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+
+class TestStatusPollLoopDeadWindowCleanup:
+    """Change 1: this loop's own dead-window cleanup must step aside when the
+    auto-topic mirror owns the job, so the two never race to unbind/clean up
+    the same thread (mirror also deletes the forum topic; this fallback path
+    can't)."""
+
+    @pytest.mark.asyncio
+    async def test_mirror_enabled_does_not_unbind(
+        self, monkeypatch, mgr: SessionManager, mock_bot: AsyncMock
+    ) -> None:
+        monkeypatch.setattr(config, "mirror_chat_id", -100999)
+        mgr.bind_thread(1, 42, "@0", window_name="proj")
+
+        with (
+            patch("ccbot.handlers.status_polling.tmux_manager") as mock_tmux,
+            patch(
+                "ccbot.handlers.status_polling.clear_topic_state",
+                new_callable=AsyncMock,
+            ) as mock_cleanup,
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=None)
+            await _run_one_tick(mock_bot)
+
+            mock_cleanup.assert_not_called()
+            assert mgr.get_window_for_thread(1, 42) == "@0"
+
+    @pytest.mark.asyncio
+    async def test_mirror_disabled_still_unbinds(
+        self, monkeypatch, mgr: SessionManager, mock_bot: AsyncMock
+    ) -> None:
+        monkeypatch.setattr(config, "mirror_chat_id", None)
+        mgr.bind_thread(1, 42, "@0", window_name="proj")
+
+        with (
+            patch("ccbot.handlers.status_polling.tmux_manager") as mock_tmux,
+            patch(
+                "ccbot.handlers.status_polling.clear_topic_state",
+                new_callable=AsyncMock,
+            ) as mock_cleanup,
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=None)
+            await _run_one_tick(mock_bot)
+
+            mock_cleanup.assert_awaited_once_with(1, 42, mock_bot)
+            assert mgr.get_window_for_thread(1, 42) is None
