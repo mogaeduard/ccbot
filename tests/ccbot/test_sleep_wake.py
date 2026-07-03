@@ -33,6 +33,21 @@ def _make_context() -> MagicMock:
     return context
 
 
+@pytest.fixture(autouse=True)
+def _mock_overnight(monkeypatch):
+    """sleep_command/wake_command now call into overnight.py (arm on
+    /sleep, disarm_and_report on /wake when armed) — mock it out so these
+    command-flow tests never touch the real session_manager singleton's
+    overnight_armed field. Dedicated overnight.py coverage lives in
+    test_overnight.py; the wiring itself is asserted in
+    TestOvernightWiring below."""
+    monkeypatch.setattr(bot_module, "overnight_arm", MagicMock())
+    monkeypatch.setattr(bot_module, "overnight_disarm_and_report", AsyncMock())
+    monkeypatch.setattr(
+        bot_module.session_manager, "is_overnight_armed", MagicMock(return_value=False)
+    )
+
+
 class TestParseHHMM:
     def test_valid(self) -> None:
         assert _parse_hhmm("09:15") == (9, 15)
@@ -177,3 +192,42 @@ class TestWakeCommand:
         with patch("ccbot.bot.is_user_allowed", return_value=True):
             await wake_command(update, _make_context())
         update.message.reply_text.assert_awaited_once()
+
+
+class TestOvernightWiring:
+    """/sleep arms overnight.py, /wake disarms+reports only when armed —
+    the safety-critical interaction from the overnight-autonomy design."""
+
+    @pytest.mark.asyncio
+    async def test_sleep_arms_overnight(self, monkeypatch, tmp_path) -> None:
+        monkeypatch.setenv("CCBOT_DIR", str(tmp_path))
+        update = _make_update("/sleep 09:15")
+        with patch("ccbot.bot.is_user_allowed", return_value=True):
+            await sleep_command(update, _make_context())
+        bot_module.overnight_arm.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_wake_disarms_and_reports_when_armed(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        monkeypatch.setenv("CCBOT_DIR", str(tmp_path))
+        monkeypatch.setattr(
+            bot_module.session_manager,
+            "is_overnight_armed",
+            MagicMock(return_value=True),
+        )
+        update = _make_update("/wake")
+        context = _make_context()
+        with patch("ccbot.bot.is_user_allowed", return_value=True):
+            await wake_command(update, context)
+        bot_module.overnight_disarm_and_report.assert_awaited_once_with(context.bot)
+
+    @pytest.mark.asyncio
+    async def test_wake_skips_report_when_not_armed(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        monkeypatch.setenv("CCBOT_DIR", str(tmp_path))
+        update = _make_update("/wake")
+        with patch("ccbot.bot.is_user_allowed", return_value=True):
+            await wake_command(update, _make_context())
+        bot_module.overnight_disarm_and_report.assert_not_awaited()

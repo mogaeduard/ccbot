@@ -36,6 +36,8 @@ Core responsibilities:
   - /dashboard: force-recreates the pinned live terminal overview in the
     group's General topic (see dashboard.py), which is otherwise kept
     current by its own background poll loop.
+  - /sleep additionally arms overnight-autonomy checkpointing, /wake
+    disarms it and sends the morning report DM (see overnight.py).
   - Bot lifecycle management: post_init, post_shutdown, create_bot.
 
 Handler modules (in handlers/):
@@ -164,6 +166,9 @@ from .handlers.message_sender import (
 )
 from .markdown_v2 import convert_markdown
 from .mirror import mirror_poll_loop, mirror_tick
+from .overnight import arm as overnight_arm
+from .overnight import disarm_and_report as overnight_disarm_and_report
+from .overnight import overnight_poll_loop
 from .handlers.response_builder import build_response_parts
 from .handlers.status_polling import status_poll_loop
 from .screenshot import text_to_image
@@ -189,6 +194,10 @@ _mirror_poll_task: asyncio.Task | None = None
 
 # Live dashboard polling task (only started when CCBOT_MIRROR_CHAT_ID is set)
 _dashboard_poll_task: asyncio.Task | None = None
+
+# Overnight-autonomy snapshot polling task (see overnight.py) — started
+# unconditionally, gated at runtime by session_manager.is_overnight_armed().
+_overnight_poll_task: asyncio.Task | None = None
 
 # Claude Code commands shown in bot menu (forwarded via tmux)
 CC_COMMANDS: dict[str, str] = {
@@ -466,12 +475,16 @@ async def sleep_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     quiet_until_file = ccbot_dir() / "quiet-until"
     quiet_until_file.parent.mkdir(parents=True, exist_ok=True)
     quiet_until_file.write_text(str(int(wake.timestamp())))
+    overnight_arm()
 
     await safe_reply(update.message, f"😴 Quiet until {wake.strftime('%H:%M')}")
 
 
 async def wake_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/wake: cancel quiet hours by deleting ~/.ccbot/quiet-until."""
+    """/wake: cancel quiet hours by deleting ~/.ccbot/quiet-until. If
+    overnight mode was armed, disarm it and DM the morning report first —
+    see overnight.py (the poll loop itself auto-disarms+reports if this
+    command is never sent)."""
     user = update.effective_user
     if not user or not is_user_allowed(user.id):
         return
@@ -479,6 +492,8 @@ async def wake_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     (ccbot_dir() / "quiet-until").unlink(missing_ok=True)
+    if session_manager.is_overnight_armed():
+        await overnight_disarm_and_report(context.bot)
     await safe_reply(update.message, "☀️ Awake — pings back on")
 
 
@@ -2693,6 +2708,7 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
 
 async def post_init(application: Application) -> None:
     global session_monitor, _status_poll_task, _mirror_poll_task, _dashboard_poll_task
+    global _overnight_poll_task
 
     await application.bot.delete_my_commands()
 
@@ -2747,6 +2763,11 @@ async def post_init(application: Application) -> None:
     _status_poll_task = asyncio.create_task(status_poll_loop(application.bot))
     logger.info("Status polling task started")
 
+    # Overnight-autonomy snapshot loop: always running (armed state is a
+    # runtime /sleep-/wake toggle, not a startup config gate — see overnight.py).
+    _overnight_poll_task = asyncio.create_task(overnight_poll_loop(application.bot))
+    logger.info("Overnight polling task started")
+
     # Auto-topic mirror: converge drift accumulated while the daemon was down
     # (dead windows' topics deleted, live unbound windows get topics) with one
     # synchronous pass *before* the bot starts processing updates — relying on
@@ -2769,6 +2790,7 @@ async def post_init(application: Application) -> None:
 
 async def post_shutdown(application: Application) -> None:
     global _status_poll_task, _mirror_poll_task, _dashboard_poll_task
+    global _overnight_poll_task
 
     # Stop status polling
     if _status_poll_task:
@@ -2799,6 +2821,16 @@ async def post_shutdown(application: Application) -> None:
             pass
         _dashboard_poll_task = None
         logger.info("Dashboard polling stopped")
+
+    # Stop overnight polling
+    if _overnight_poll_task:
+        _overnight_poll_task.cancel()
+        try:
+            await _overnight_poll_task
+        except asyncio.CancelledError:
+            pass
+        _overnight_poll_task = None
+        logger.info("Overnight polling stopped")
 
     # Stop all queue workers
     await shutdown_workers()

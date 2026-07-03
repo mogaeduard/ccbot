@@ -24,6 +24,8 @@ Key methods for thread binding access:
     the window by send_to_window itself (as opposed to on the Mac terminal)?
     One-shot: a match is consumed so it can only suppress one echo.
   - is_locked / set_locked: /lock kill switch for inbound updates.
+  - is_overnight_armed / set_overnight_armed: overnight-autonomy arm switch
+    (see overnight.py), toggled by /sleep and /wake.
 """
 
 import asyncio
@@ -106,6 +108,9 @@ class SessionManager:
     dashboard_message_id: message_id of the pinned live dashboard in the
       group's General topic (see dashboard.py). Persisted so a daemon
       restart reuses the same message instead of creating a duplicate.
+    overnight_armed: overnight-autonomy arm switch (see overnight.py),
+      toggled by /sleep and /wake. Persisted so an armed night survives a
+      daemon restart.
     """
 
     window_states: dict[str, WindowState] = field(default_factory=dict)
@@ -128,6 +133,8 @@ class SessionManager:
     # Pinned live-dashboard message_id (see dashboard.py), or None if not
     # yet created / lost. Persisted so a daemon restart reuses it.
     dashboard_message_id: int | None = None
+    # Overnight-autonomy arm switch (see is_overnight_armed/set_overnight_armed).
+    overnight_armed: bool = False
 
     # How long an injection stays "fresh" for echo suppression (see
     # was_recently_injected). Not persisted — resets on restart, which is
@@ -159,6 +166,7 @@ class SessionManager:
             "group_chat_ids": self.group_chat_ids,
             "locked": self.locked,
             "dashboard_message_id": self.dashboard_message_id,
+            "overnight_armed": self.overnight_armed,
         }
         atomic_write_json(config.state_file, state)
         logger.debug("State saved to %s", config.state_file)
@@ -194,6 +202,7 @@ class SessionManager:
                 }
                 self.locked = bool(state.get("locked", False))
                 self.dashboard_message_id = state.get("dashboard_message_id")
+                self.overnight_armed = bool(state.get("overnight_armed", False))
 
                 # Detect old format: keys that don't look like window IDs
                 needs_migration = False
@@ -226,6 +235,7 @@ class SessionManager:
                 self.group_chat_ids = {}
                 self.locked = False
                 self.dashboard_message_id = None
+                self.overnight_armed = False
                 pass
 
     async def resolve_stale_ids(self) -> None:
@@ -463,6 +473,21 @@ class SessionManager:
             self.locked = value
             self._save_state()
             logger.info("Lock state changed: locked=%s", value)
+
+    # --- Overnight autonomy arm switch (/sleep, /wake — see overnight.py) ---
+
+    def is_overnight_armed(self) -> bool:
+        """True while overnight checkpointing is armed (between /sleep and
+        /wake, or until quiet-until auto-disarms it)."""
+        return self.overnight_armed
+
+    def set_overnight_armed(self, value: bool) -> None:
+        """Set the overnight-armed state and persist it (survives a daemon
+        restart, mirroring set_locked)."""
+        if self.overnight_armed != value:
+            self.overnight_armed = value
+            self._save_state()
+            logger.info("Overnight armed state changed: armed=%s", value)
 
     # --- Live dashboard message tracking (see dashboard.py) ---
 
