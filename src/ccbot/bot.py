@@ -55,6 +55,7 @@ import asyncio
 import io
 import logging
 import httpx
+import re
 import shlex
 import time
 from dataclasses import dataclass
@@ -573,6 +574,23 @@ def _grab_target(raw_path: str, cwd: str) -> tuple[Path | None, str | None]:
 TTS_SPEAK_URL = "http://127.0.0.1:8838/speak"
 TTS_MAX_CHARS = 800
 
+# Long answers get a spoken-style summary before TTS instead of being read
+# in full, so voice notes stay short. Threshold/limits are chosen so both
+# the validated CLI summary and the extractive fallback land well under
+# TTS_MAX_CHARS.
+SUMMARIZE_THRESHOLD_CHARS = 300
+SUMMARY_MAX_CHARS = 600
+FALLBACK_MAX_CHARS = 250
+SUMMARY_CLI_BIN = "/Users/mogaeduard/.local/bin/claude"
+SUMMARY_MODEL = "claude-haiku-4-5-20251001"
+SUMMARY_TIMEOUT_S = 45.0
+SUMMARY_PROMPT = (
+    "Summarize the following assistant answer in 1-3 short spoken-style "
+    "sentences, in the SAME language as the answer (Romanian stays "
+    "Romanian, English stays English). No markdown, no emoji, no preamble "
+    "— just the sentences. ANSWER: {text}"
+)
+
 
 def last_assistant_text(messages: list[dict]) -> str | None:
     """Pick the most recent assistant text message worth speaking."""
@@ -586,9 +604,92 @@ def last_assistant_text(messages: list[dict]) -> str | None:
     return None
 
 
+def should_summarize(text: str) -> bool:
+    """Only long answers pay for a summarization pass; short ones are
+    spoken as-is."""
+    return len(text) > SUMMARIZE_THRESHOLD_CHARS
+
+
+def extractive_fallback(text: str, max_chars: int = FALLBACK_MAX_CHARS) -> str:
+    """Naive fallback summary: first 1-2 sentences, hard-capped at
+    max_chars, with a trailing "…" whenever something was cut off."""
+    stripped = text.strip()
+    sentences = re.split(r"(?<=[.!?])\s+", stripped)
+    summary = " ".join(sentences[:2]).strip()
+    truncated = len(sentences) > 2
+    if len(summary) > max_chars:
+        summary = summary[: max_chars - 1].rstrip()
+        truncated = True
+    return summary + "…" if truncated else summary
+
+
+def _is_valid_summary(summary: str) -> bool:
+    """A CLI summary is usable if non-empty and within SUMMARY_MAX_CHARS
+    after stripping."""
+    stripped = summary.strip()
+    return bool(stripped) and len(stripped) <= SUMMARY_MAX_CHARS
+
+
+async def _summarize_via_claude_cli(text: str) -> str | None:
+    """Shell out to the Claude CLI headlessly for a 1-3 sentence
+    spoken-style summary. --settings disableAllHooks is required so the
+    user's own Stop-hook pager doesn't fire a DM for this internal call.
+    Returns None on any failure (binary missing, timeout, non-zero exit) —
+    the caller falls back to extractive_fallback."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            SUMMARY_CLI_BIN,
+            "-p",
+            "--model",
+            SUMMARY_MODEL,
+            "--settings",
+            '{"disableAllHooks":true}',
+            SUMMARY_PROMPT.format(text=text),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except OSError as e:
+        logger.warning("/speak: claude CLI unavailable for summary: %s", e)
+        return None
+
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(), timeout=SUMMARY_TIMEOUT_S
+        )
+    except asyncio.TimeoutError:
+        logger.warning("/speak: claude CLI summary timed out")
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        await proc.wait()
+        return None
+
+    if proc.returncode != 0:
+        logger.warning(
+            "/speak: claude CLI summary exited %s: %s",
+            proc.returncode,
+            stderr.decode("utf-8", errors="replace").strip(),
+        )
+        return None
+
+    return stdout.decode("utf-8", errors="replace").strip()
+
+
+async def summarize_for_speech(text: str) -> str:
+    """1-3 sentence spoken-style summary of `text` for /speak — the Claude
+    CLI when it produces something valid, otherwise a naive extractive
+    fallback. Only meant to be called when should_summarize(text) is True."""
+    summary = await _summarize_via_claude_cli(text)
+    if summary is not None and _is_valid_summary(summary):
+        return summary.strip()
+    return extractive_fallback(text)
+
+
 async def speak_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/speak: synthesize the topic's last answer as a voice note (local
-    XTTS server with the cloned voice; RO+EN)."""
+    XTTS server with the cloned voice; RO+EN). Long answers are summarized
+    to 1-3 spoken-style sentences first — see summarize_for_speech."""
     user = update.effective_user
     if not user or not is_user_allowed(user.id):
         return
@@ -608,8 +709,6 @@ async def speak_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not text:
         await safe_reply(update.message, "🔇 Nothing to speak yet in this terminal.")
         return
-    if len(text) > TTS_MAX_CHARS:
-        text = text[: TTS_MAX_CHARS - 1] + "…"
 
     try:
         await update.message.chat.send_action(
@@ -617,6 +716,11 @@ async def speak_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
     except Exception:  # cosmetic only
         pass
+
+    if should_summarize(text):
+        text = await summarize_for_speech(text)
+    if len(text) > TTS_MAX_CHARS:
+        text = text[: TTS_MAX_CHARS - 1] + "…"
 
     try:
         client = httpx.AsyncClient(timeout=120.0)
