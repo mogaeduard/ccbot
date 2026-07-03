@@ -1010,6 +1010,13 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             _capture_bash_output(context.bot, user.id, thread_id, wid, bash_cmd)
         )
         _bash_capture_tasks[(user.id, thread_id)] = task
+    elif not session_manager.get_window_state(wid).session_id:
+        # Plain-shell window (no Claude session → no transcript to mirror):
+        # echo the terminal's own output back, reusing the ! capture task.
+        task = asyncio.create_task(
+            _capture_bash_output(context.bot, user.id, thread_id, wid, text)
+        )
+        _bash_capture_tasks[(user.id, thread_id)] = task
 
     # If in interactive mode, refresh the UI after sending text
     interactive_window = get_interactive_window(user.id, thread_id)

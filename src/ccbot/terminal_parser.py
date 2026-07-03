@@ -285,6 +285,18 @@ def extract_bash_output(pane_text: str, command: str) -> str | None:
             break
 
     if cmd_idx is None:
+        # Plain-shell fallback: no "! cmd" echo in a window that isn't
+        # running Claude — match the shell's own prompt echo instead, i.e.
+        # the last line that ends with the typed command (prompt prefixes
+        # vary). ponytail: heuristic — an output line ending with the same
+        # text can shadow the echo; worst case the capture starts low.
+        wanted = command.strip()
+        for i in range(len(lines) - 1, -1, -1):
+            if lines[i].strip().endswith(wanted):
+                cmd_idx = i
+                break
+
+    if cmd_idx is None:
         return None
 
     # Include the command echo line and everything after it

@@ -182,18 +182,14 @@ class TestCloseDeadTopics:
         monkeypatch.setattr(
             mirror.tmux_manager, "list_windows", AsyncMock(return_value=[])
         )
-        send_mock = AsyncMock()
-        monkeypatch.setattr(mirror, "safe_send", send_mock)
         cleanup_mock = AsyncMock()
         monkeypatch.setattr(mirror, "clear_topic_state", cleanup_mock)
 
         await mirror.mirror_tick(bot)
 
-        bot.close_forum_topic.assert_awaited_once_with(
+        bot.delete_forum_topic.assert_awaited_once_with(
             chat_id=config.mirror_chat_id, message_thread_id=42
         )
-        send_mock.assert_awaited_once()
-        assert "terminal ended" in send_mock.await_args.args[2].lower()
         assert mgr.get_window_for_thread(user_id, 42) is None
         cleanup_mock.assert_awaited_once_with(user_id, 42, bot)
 
@@ -206,13 +202,9 @@ class TestCloseDeadTopics:
         monkeypatch.setattr(
             mirror.tmux_manager, "list_windows", AsyncMock(return_value=[])
         )
-        send_mock = AsyncMock()
-        monkeypatch.setattr(mirror, "safe_send", send_mock)
-
         await mirror.mirror_tick(bot)
 
-        bot.close_forum_topic.assert_not_called()
-        send_mock.assert_not_called()
+        bot.delete_forum_topic.assert_not_called()
         # Binding untouched
         assert mgr.get_window_for_thread(100, 7) == "@0"
 
@@ -231,5 +223,5 @@ class TestCloseDeadTopics:
 
         await mirror.mirror_tick(bot)
 
-        bot.close_forum_topic.assert_not_called()
+        bot.delete_forum_topic.assert_not_called()
         assert mgr.get_window_for_thread(user_id, 42) == "@0"

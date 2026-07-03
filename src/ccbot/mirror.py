@@ -31,7 +31,6 @@ from telegram.error import TelegramError
 
 from .config import config
 from .handlers.cleanup import clear_topic_state
-from .handlers.message_sender import safe_send
 from .session import session_manager
 from .tmux_manager import tmux_manager
 
@@ -93,27 +92,14 @@ async def _close_dead_topics(bot: Bot, mirror_chat_id: int) -> None:
         if session_manager.group_chat_ids.get(key) != mirror_chat_id:
             continue  # not a mirror-owned binding — leave to normal cleanup
 
-        display = session_manager.get_display_name(window_id)
-        # Notice before close: bots may not be able to post into a closed topic.
+        # Delete (not close) the topic: a closetab'd/X-closed terminal should
+        # vanish from Telegram entirely, mirroring `tabs` on the Mac.
         try:
-            await safe_send(
-                bot,
-                mirror_chat_id,
-                f"🔌 Terminal ended: {display}",
-                message_thread_id=thread_id,
-            )
-        except TelegramError as e:
-            logger.debug(
-                "Mirror: failed to post terminal-ended notice for topic %d: %s",
-                thread_id,
-                e,
-            )
-        try:
-            await bot.close_forum_topic(
+            await bot.delete_forum_topic(
                 chat_id=mirror_chat_id, message_thread_id=thread_id
             )
         except TelegramError as e:
-            logger.debug("Mirror: failed to close topic %d: %s", thread_id, e)
+            logger.debug("Mirror: failed to delete topic %d: %s", thread_id, e)
 
         session_manager.unbind_thread(user_id, thread_id)
         await clear_topic_state(user_id, thread_id, bot)
