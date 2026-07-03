@@ -341,6 +341,8 @@ class TestPostInitStartupReconcile:
             patch("ccbot.bot.status_poll_loop", new_callable=AsyncMock),
             patch("ccbot.bot.mirror_tick", new_callable=AsyncMock) as mock_tick,
             patch("ccbot.bot.mirror_poll_loop", new_callable=AsyncMock) as mock_loop,
+            patch("ccbot.bot.dashboard_tick", new_callable=AsyncMock),
+            patch("ccbot.bot.dashboard_poll_loop", new_callable=AsyncMock),
         ):
             mock_sm.resolve_stale_ids = AsyncMock()
             mock_monitor_cls.return_value = MagicMock()

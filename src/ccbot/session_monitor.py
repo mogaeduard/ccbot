@@ -15,6 +15,13 @@ either when the next real user message appears or after a short quiet period
 with no new transcript entries (see _apply_turn_buffering / TEXT_FLUSH_QUIET_SECONDS).
 All other content types (thinking, tool_use, tool_result, ...) are unaffected.
 
+AI-title detection: Claude Code also writes raw (non user/assistant) entries
+of the form {"type": "ai-title", "aiTitle": "...", "sessionId": "..."} into
+the same JSONL — these are dropped by TranscriptParser (it only handles
+user/assistant), so they're scanned directly from the raw lines read by
+_read_new_lines (see _detect_ai_titles) and reported via the title callback
+(set_title_callback) whenever the title text actually changes for a session.
+
 Key classes: SessionMonitor, NewMessage, SessionInfo.
 """
 
@@ -97,11 +104,14 @@ class SessionMonitor:
         self._running = False
         self._task: asyncio.Task | None = None
         self._message_callback: Callable[[NewMessage], Awaitable[None]] | None = None
+        self._title_callback: Callable[[str, str], Awaitable[None]] | None = None
         # Per-session pending tool_use state carried across poll cycles
         self._pending_tools: dict[str, dict[str, Any]] = {}  # session_id -> pending
         # Per-session buffered mid-turn assistant text, carried across poll
         # cycles (see TEXT_FLUSH_QUIET_SECONDS / _apply_turn_buffering).
         self._pending_text: dict[str, _PendingText] = {}
+        # Per-session last-seen ai-title text (dedup — see _detect_ai_titles).
+        self._last_ai_title: dict[str, str] = {}
         # Track last known session_map for detecting changes
         # Keys may be window_id (@12) or window_name (old format) during transition
         self._last_session_map: dict[str, str] = {}  # window_key -> session_id
@@ -112,6 +122,38 @@ class SessionMonitor:
         self, callback: Callable[[NewMessage], Awaitable[None]]
     ) -> None:
         self._message_callback = callback
+
+    def set_title_callback(
+        self, callback: Callable[[str, str], Awaitable[None]]
+    ) -> None:
+        """Register a callback fired as (session_id, ai_title) whenever a
+        session's ai-title changes (see _detect_ai_titles)."""
+        self._title_callback = callback
+
+    def _detect_ai_titles(
+        self, session_id: str, raw_entries: list[dict]
+    ) -> list[tuple[str, str]]:
+        """Scan raw JSONL entries for ai-title changes.
+
+        Returns (session_id, ai_title) pairs to report, skipping entries
+        whose title text matches what was last seen for that session_id
+        (updated as a side effect in self._last_ai_title). Entries carry
+        their own "sessionId" field; falls back to the tracked session_id
+        if absent.
+        """
+        detected: list[tuple[str, str]] = []
+        for raw in raw_entries:
+            if raw.get("type") != "ai-title":
+                continue
+            title = raw.get("aiTitle") or ""
+            if not title:
+                continue
+            sid = raw.get("sessionId") or session_id
+            if self._last_ai_title.get(sid) == title:
+                continue
+            self._last_ai_title[sid] = title
+            detected.append((sid, title))
+        return detected
 
     async def _get_active_cwds(self) -> set[str]:
         """Get normalized cwds of all active tmux windows."""
@@ -451,6 +493,17 @@ class SessionMonitor:
                         f"session {session_info.session_id}"
                     )
 
+                # ai-title entries aren't user/assistant messages, so scan the
+                # raw lines directly before TranscriptParser drops them.
+                for sid, title in self._detect_ai_titles(
+                    session_info.session_id, new_entries
+                ):
+                    if self._title_callback:
+                        try:
+                            await self._title_callback(sid, title)
+                        except Exception as e:
+                            logger.debug("Title callback error: %s", e)
+
                 # Parse new entries using the shared logic, carrying over pending tools
                 carry = self._pending_tools.get(session_info.session_id, {})
                 parsed_entries, remaining = TranscriptParser.parse_entries(
@@ -535,6 +588,7 @@ class SessionMonitor:
                 self.state.remove_session(session_id)
                 self._file_mtimes.pop(session_id, None)
                 self._pending_text.pop(session_id, None)
+                self._last_ai_title.pop(session_id, None)
             self.state.save_if_dirty()
 
     async def _detect_and_cleanup_changes(self) -> dict[str, str]:
@@ -578,6 +632,7 @@ class SessionMonitor:
                 self.state.remove_session(session_id)
                 self._file_mtimes.pop(session_id, None)
                 self._pending_text.pop(session_id, None)
+                self._last_ai_title.pop(session_id, None)
             self.state.save_if_dirty()
 
         # Update last known map

@@ -103,6 +103,9 @@ class SessionManager:
     group_chat_ids: "user_id:thread_id" -> group chat_id (for supergroup routing)
     locked: /lock kill switch — while True, bot.py's lock gate drops every
       inbound update except /unlock before it reaches any handler.
+    dashboard_message_id: message_id of the pinned live dashboard in the
+      group's General topic (see dashboard.py). Persisted so a daemon
+      restart reuses the same message instead of creating a duplicate.
     """
 
     window_states: dict[str, WindowState] = field(default_factory=dict)
@@ -122,6 +125,9 @@ class SessionManager:
     # /lock kill switch (see is_locked/set_locked). Persisted so a locked
     # bot stays locked across a daemon restart.
     locked: bool = False
+    # Pinned live-dashboard message_id (see dashboard.py), or None if not
+    # yet created / lost. Persisted so a daemon restart reuses it.
+    dashboard_message_id: int | None = None
 
     # How long an injection stays "fresh" for echo suppression (see
     # was_recently_injected). Not persisted — resets on restart, which is
@@ -152,6 +158,7 @@ class SessionManager:
             "window_display_names": self.window_display_names,
             "group_chat_ids": self.group_chat_ids,
             "locked": self.locked,
+            "dashboard_message_id": self.dashboard_message_id,
         }
         atomic_write_json(config.state_file, state)
         logger.debug("State saved to %s", config.state_file)
@@ -186,6 +193,7 @@ class SessionManager:
                     k: int(v) for k, v in state.get("group_chat_ids", {}).items()
                 }
                 self.locked = bool(state.get("locked", False))
+                self.dashboard_message_id = state.get("dashboard_message_id")
 
                 # Detect old format: keys that don't look like window IDs
                 needs_migration = False
@@ -217,6 +225,7 @@ class SessionManager:
                 self.window_display_names = {}
                 self.group_chat_ids = {}
                 self.locked = False
+                self.dashboard_message_id = None
                 pass
 
     async def resolve_stale_ids(self) -> None:
@@ -454,6 +463,18 @@ class SessionManager:
             self.locked = value
             self._save_state()
             logger.info("Lock state changed: locked=%s", value)
+
+    # --- Live dashboard message tracking (see dashboard.py) ---
+
+    def get_dashboard_message_id(self) -> int | None:
+        """Get the persisted message_id of the pinned live dashboard, if any."""
+        return self.dashboard_message_id
+
+    def set_dashboard_message_id(self, message_id: int | None) -> None:
+        """Persist the live dashboard's message_id (or clear it with None)."""
+        if self.dashboard_message_id != message_id:
+            self.dashboard_message_id = message_id
+            self._save_state()
 
     # --- Group chat ID management (supergroup forum topic routing) ---
 

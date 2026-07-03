@@ -29,6 +29,13 @@ Core responsibilities:
   - Automatic cleanup: closing a topic kills the associated window
     (topic_closed_handler). Unsupported content (stickers, etc.)
     is rejected with a warning (unsupported_content_handler).
+  - /new <project>: resolves a project name against the directory
+    browser's own root (case-insensitive exact/prefix match), creates a
+    tmux window running Claude there, and lets the mirror tick create and
+    bind its topic (new_command) — usable from anywhere in the group.
+  - /dashboard: force-recreates the pinned live terminal overview in the
+    group's General topic (see dashboard.py), which is otherwise kept
+    current by its own background poll loop.
   - Bot lifecycle management: post_init, post_shutdown, create_bot.
 
 Handler modules (in handlers/):
@@ -118,6 +125,7 @@ from .handlers.directory_browser import (
     clear_session_picker_state,
     clear_window_picker_state,
 )
+from .dashboard import dashboard_poll_loop, dashboard_tick, force_recreate
 from .handlers.cleanup import clear_topic_state
 from .handlers.dialog_fallback import (
     clear_fallback_msg,
@@ -158,6 +166,7 @@ from .session import session_manager
 from .session_monitor import NewMessage, SessionMonitor
 from .terminal_parser import extract_bash_output, is_interactive_ui
 from .tmux_manager import tmux_manager
+from .topic_titles import on_ai_title
 from .transcribe import close_client as close_transcribe_client
 from .transcribe import transcribe_voice
 from .utils import ccbot_dir
@@ -172,6 +181,9 @@ _status_poll_task: asyncio.Task | None = None
 
 # Auto-topic mirror polling task (only started when CCBOT_MIRROR_CHAT_ID is set)
 _mirror_poll_task: asyncio.Task | None = None
+
+# Live dashboard polling task (only started when CCBOT_MIRROR_CHAT_ID is set)
+_dashboard_poll_task: asyncio.Task | None = None
 
 # Claude Code commands shown in bot menu (forwarded via tmux)
 CC_COMMANDS: dict[str, str] = {
@@ -396,6 +408,90 @@ async def unlock_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     session_manager.set_locked(False)
     await safe_reply(update.message, "🔓 Unlocked.")
+
+
+async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Force-recreate the pinned live dashboard in the group's General topic."""
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+    if not update.message:
+        return
+    if not config.mirror_chat_id:
+        await safe_reply(update.message, "❌ Dashboard requires CCBOT_MIRROR_CHAT_ID.")
+        return
+    await force_recreate(context.bot)
+    await safe_reply(update.message, "📌 Dashboard recreated.")
+
+
+def _resolve_project(name: str, subdirs: list[str]) -> tuple[str | None, list[str]]:
+    """Resolve a project name against directory names, case-insensitively.
+
+    Tries an exact match first, then a unique prefix match. Returns
+    (resolved_name, candidates): resolved_name is set on a clean match;
+    candidates lists every prefix match when the name is ambiguous
+    (empty on a clean match or no match at all).
+    """
+    lname = name.lower()
+    for d in subdirs:
+        if d.lower() == lname:
+            return d, []
+    prefix_matches = [d for d in subdirs if d.lower().startswith(lname)]
+    if len(prefix_matches) == 1:
+        return prefix_matches[0], []
+    return None, prefix_matches
+
+
+async def new_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/new <project>: start Claude in a project dir, usable anywhere in the group.
+
+    Resolves <project> against the directory browser's own root (its
+    starting directory — see build_directory_browser / text_handler), then
+    creates a tmux window there running the configured claude command. The
+    topic itself is created and bound by the next mirror tick, not here —
+    creating it eagerly would race the mirror's own topic-creation pass.
+    """
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+    if not update.message:
+        return
+
+    chat = update.effective_chat
+    thread_id = _get_thread_id(update)
+    if chat and chat.type in ("group", "supergroup"):
+        session_manager.set_group_chat_id(user.id, thread_id, chat.id)
+
+    text = update.message.text or ""
+    parts = text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await safe_reply(update.message, "Usage: /new <project>")
+        return
+    project = parts[1].strip()
+
+    root = Path.cwd()
+    _, _, subdirs = build_directory_browser(str(root))
+    resolved, candidates = _resolve_project(project, subdirs)
+    if resolved is None:
+        if candidates:
+            listing = ", ".join(sorted(candidates))
+            await safe_reply(
+                update.message, f"❌ Ambiguous project '{project}': {listing}"
+            )
+        else:
+            await safe_reply(update.message, f"❌ No project matching '{project}'")
+        return
+
+    success, message, _wname, _wid = await tmux_manager.create_window(
+        str(root / resolved), start_claude=True
+    )
+    if not success:
+        await safe_reply(update.message, f"❌ {message}")
+        return
+
+    await safe_reply(
+        update.message, f"🚀 {resolved} starting — topic appears in a few seconds"
+    )
 
 
 # --- Lock gate: runs before every other handler (see registration in
@@ -2206,18 +2302,20 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
 
 
 async def post_init(application: Application) -> None:
-    global session_monitor, _status_poll_task, _mirror_poll_task
+    global session_monitor, _status_poll_task, _mirror_poll_task, _dashboard_poll_task
 
     await application.bot.delete_my_commands()
 
     bot_commands = [
         BotCommand("start", "Show welcome message"),
+        BotCommand("new", "Start Claude in <project> (anywhere in the group)"),
         BotCommand("history", "Message history for this topic"),
         BotCommand("screenshot", "Terminal screenshot with control keys"),
         BotCommand("esc", "Send Escape to interrupt Claude"),
         BotCommand("kill", "Kill session and delete topic"),
         BotCommand("unbind", "Unbind topic from session (keeps window running)"),
         BotCommand("usage", "Show Claude Code usage remaining"),
+        BotCommand("dashboard", "Recreate the live terminal dashboard"),
         BotCommand("lock", "Freeze all inbound control (kill switch)"),
         BotCommand("unlock", "Release the lock"),
     ]
@@ -2246,7 +2344,11 @@ async def post_init(application: Application) -> None:
     async def message_callback(msg: NewMessage) -> None:
         await handle_new_message(msg, application.bot)
 
+    async def title_callback(session_id: str, ai_title: str) -> None:
+        await on_ai_title(application.bot, session_id, ai_title)
+
     monitor.set_message_callback(message_callback)
+    monitor.set_title_callback(title_callback)
     monitor.start()
     session_monitor = monitor
     logger.info("Session monitor started")
@@ -2267,9 +2369,16 @@ async def post_init(application: Application) -> None:
         _mirror_poll_task = asyncio.create_task(mirror_poll_loop(application.bot))
         logger.info("Mirror polling task started (chat_id=%d)", config.mirror_chat_id)
 
+        # Live dashboard: separate task from the mirror above (see
+        # dashboard.py's module docstring) but the same gate/cadence — the
+        # dashboard lives in this same forum group's General topic.
+        await dashboard_tick(application.bot)
+        _dashboard_poll_task = asyncio.create_task(dashboard_poll_loop(application.bot))
+        logger.info("Dashboard polling task started")
+
 
 async def post_shutdown(application: Application) -> None:
-    global _status_poll_task, _mirror_poll_task
+    global _status_poll_task, _mirror_poll_task, _dashboard_poll_task
 
     # Stop status polling
     if _status_poll_task:
@@ -2290,6 +2399,16 @@ async def post_shutdown(application: Application) -> None:
             pass
         _mirror_poll_task = None
         logger.info("Mirror polling stopped")
+
+    # Stop dashboard polling
+    if _dashboard_poll_task:
+        _dashboard_poll_task.cancel()
+        try:
+            await _dashboard_poll_task
+        except asyncio.CancelledError:
+            pass
+        _dashboard_poll_task = None
+        logger.info("Dashboard polling stopped")
 
     # Stop all queue workers
     await shutdown_workers()
@@ -2318,11 +2437,13 @@ def create_bot() -> Application:
     application.add_handler(CallbackQueryHandler(lock_gate_handler), group=-1)
 
     application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("new", new_command))
     application.add_handler(CommandHandler("history", history_command))
     application.add_handler(CommandHandler("screenshot", screenshot_command))
     application.add_handler(CommandHandler("esc", esc_command))
     application.add_handler(CommandHandler("unbind", unbind_command))
     application.add_handler(CommandHandler("usage", usage_command))
+    application.add_handler(CommandHandler("dashboard", dashboard_command))
     application.add_handler(CommandHandler("lock", lock_command))
     application.add_handler(CommandHandler("unlock", unlock_command))
     application.add_handler(CallbackQueryHandler(callback_handler))

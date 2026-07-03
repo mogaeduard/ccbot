@@ -250,6 +250,104 @@ class TestFlushStalePendingText:
         assert monitor._flush_stale_pending_text() == []
 
 
+class TestDetectAiTitles:
+    """Tests for _detect_ai_titles — the raw ai-title scan (these entries
+    aren't user/assistant messages, so TranscriptParser never sees them)."""
+
+    @pytest.fixture
+    def monitor(self, tmp_path):
+        return SessionMonitor(
+            projects_path=tmp_path / "projects",
+            state_file=tmp_path / "monitor_state.json",
+        )
+
+    def test_detects_new_title(self, monitor):
+        entries = [{"type": "ai-title", "aiTitle": "Fix bug", "sessionId": "sess1"}]
+        result = monitor._detect_ai_titles("sess1", entries)
+        assert result == [("sess1", "Fix bug")]
+        assert monitor._last_ai_title["sess1"] == "Fix bug"
+
+    def test_ignores_non_ai_title_entries(self, monitor):
+        entries = [
+            {"type": "assistant", "message": {"content": "hi"}},
+            {"type": "summary", "summary": "x"},
+        ]
+        assert monitor._detect_ai_titles("sess1", entries) == []
+
+    def test_repeated_identical_title_not_re_reported(self, monitor):
+        entries = [{"type": "ai-title", "aiTitle": "Fix bug", "sessionId": "sess1"}]
+        first = monitor._detect_ai_titles("sess1", entries)
+        second = monitor._detect_ai_titles("sess1", entries)
+        assert first == [("sess1", "Fix bug")]
+        assert second == []
+
+    def test_changed_title_is_reported_again(self, monitor):
+        monitor._detect_ai_titles(
+            "sess1", [{"type": "ai-title", "aiTitle": "First", "sessionId": "sess1"}]
+        )
+        result = monitor._detect_ai_titles(
+            "sess1", [{"type": "ai-title", "aiTitle": "Second", "sessionId": "sess1"}]
+        )
+        assert result == [("sess1", "Second")]
+
+    def test_empty_title_ignored(self, monitor):
+        entries = [{"type": "ai-title", "aiTitle": "", "sessionId": "sess1"}]
+        assert monitor._detect_ai_titles("sess1", entries) == []
+
+    def test_missing_session_id_falls_back_to_tracked_session(self, monitor):
+        entries = [{"type": "ai-title", "aiTitle": "Fix bug"}]
+        result = monitor._detect_ai_titles("sess1", entries)
+        assert result == [("sess1", "Fix bug")]
+
+    def test_sessions_tracked_independently(self, monitor):
+        monitor._detect_ai_titles(
+            "sess1", [{"type": "ai-title", "aiTitle": "Same", "sessionId": "sess1"}]
+        )
+        result = monitor._detect_ai_titles(
+            "sess2", [{"type": "ai-title", "aiTitle": "Same", "sessionId": "sess2"}]
+        )
+        assert result == [("sess2", "Same")]
+
+    @pytest.mark.asyncio
+    async def test_check_for_updates_fires_title_callback(
+        self, monitor, tmp_path, make_jsonl_entry
+    ):
+        """Integration: a live ai-title line in the tracked JSONL reaches the
+        registered title callback via check_for_updates."""
+        import json
+        from unittest.mock import AsyncMock, patch
+
+        from ccbot.monitor_state import TrackedSession
+        from ccbot.session_monitor import SessionInfo
+
+        jsonl_file = tmp_path / "session.jsonl"
+        title_entry = {
+            "type": "ai-title",
+            "aiTitle": "Fix login bug",
+            "sessionId": "sess1",
+        }
+        jsonl_file.write_text(json.dumps(title_entry) + "\n", encoding="utf-8")
+
+        monitor.state.update_session(
+            TrackedSession(
+                session_id="sess1", file_path=str(jsonl_file), last_byte_offset=0
+            )
+        )
+        callback = AsyncMock()
+        monitor.set_title_callback(callback)
+
+        with patch.object(
+            monitor,
+            "scan_projects",
+            AsyncMock(
+                return_value=[SessionInfo(session_id="sess1", file_path=jsonl_file)]
+            ),
+        ):
+            await monitor.check_for_updates({"sess1"})
+
+        callback.assert_awaited_once_with("sess1", "Fix login bug")
+
+
 class TestEntryToNewMessage:
     @pytest.fixture
     def monitor(self, tmp_path):
