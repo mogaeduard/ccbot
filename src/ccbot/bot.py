@@ -54,6 +54,7 @@ Key functions: create_bot(), handle_new_message().
 import asyncio
 import io
 import logging
+import httpx
 import shlex
 import time
 from dataclasses import dataclass
@@ -565,6 +566,78 @@ def _grab_target(raw_path: str, cwd: str) -> tuple[Path | None, str | None]:
         return None, f"too large ({size / 1_048_576:.1f} MB > 50 MB): {resolved}"
 
     return resolved, None
+
+
+# --- /speak: read the last answer aloud in the cloned voice ------------------
+
+TTS_SPEAK_URL = "http://127.0.0.1:8838/speak"
+TTS_MAX_CHARS = 800
+
+
+def last_assistant_text(messages: list[dict]) -> str | None:
+    """Pick the most recent assistant text message worth speaking."""
+    for m in reversed(messages):
+        if (
+            m.get("role") == "assistant"
+            and m.get("content_type") == "text"
+            and (m.get("text") or "").strip()
+        ):
+            return m["text"].strip()
+    return None
+
+
+async def speak_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/speak: synthesize the topic's last answer as a voice note (local
+    XTTS server with the cloned voice; RO+EN)."""
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+    if not update.message:
+        return
+    thread_id = _get_thread_id(update)
+    if thread_id is None:
+        await safe_reply(update.message, "❌ Use /speak inside a terminal topic.")
+        return
+    wid = session_manager.get_window_for_thread(user.id, thread_id)
+    if wid is None:
+        await safe_reply(update.message, "❌ No terminal bound to this topic.")
+        return
+
+    messages, _ = await session_manager.get_recent_messages(wid)
+    text = last_assistant_text(messages)
+    if not text:
+        await safe_reply(update.message, "🔇 Nothing to speak yet in this terminal.")
+        return
+    if len(text) > TTS_MAX_CHARS:
+        text = text[: TTS_MAX_CHARS - 1] + "…"
+
+    try:
+        await update.message.chat.send_action(
+            ChatAction.RECORD_VOICE, message_thread_id=thread_id
+        )
+    except Exception:  # cosmetic only
+        pass
+
+    try:
+        client = httpx.AsyncClient(timeout=120.0)
+        try:
+            resp = await client.post(TTS_SPEAK_URL, json={"text": text})
+            resp.raise_for_status()
+            audio = resp.content
+        finally:
+            await client.aclose()
+    except Exception as e:
+        logger.error("/speak: TTS request failed: %s", e)
+        await safe_reply(
+            update.message, "⚠ Voice server unavailable (is claude-tts running?)"
+        )
+        return
+
+    try:
+        await update.message.reply_voice(voice=audio, message_thread_id=thread_id)
+    except Exception as e:
+        logger.error("/speak: sending voice failed: %s", e)
+        await safe_reply(update.message, f"⚠ Could not send voice note: {e}")
 
 
 async def grab_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2663,6 +2736,7 @@ def create_bot() -> Application:
     application.add_handler(CommandHandler("wake", wake_command))
     application.add_handler(CommandHandler("killall", killall_command))
     application.add_handler(CommandHandler("grab", grab_command))
+    application.add_handler(CommandHandler("speak", speak_command))
     application.add_handler(CallbackQueryHandler(callback_handler))
     # Topic created event — eagerly bind a plain-shell window
     application.add_handler(
