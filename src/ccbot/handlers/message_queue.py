@@ -15,6 +15,10 @@ Key components:
   - Message queue worker: Background task processing user's queue
   - Content task processing with tool_use/tool_result handling
   - Status message tracking and conversion (keyed by (user_id, thread_id))
+  - Thinking consolidation: all thinking blocks of one turn are edited into a
+    single message (_thinking_turns), mirroring how status messages are
+    edited in place; reset_thinking_turn (called on the next user turn)
+    starts a fresh message for the next turn's blocks
 """
 
 import asyncio
@@ -31,6 +35,7 @@ from ..markdown_v2 import convert_markdown
 from ..session import session_manager
 from ..terminal_parser import parse_status_line
 from ..tmux_manager import tmux_manager
+from ..transcript_parser import TranscriptParser
 from .message_sender import (
     NO_LINK_PREVIEW,
     PARSE_MODE,
@@ -55,7 +60,7 @@ MERGE_MAX_LENGTH = 3800  # Leave room for markdown conversion overhead
 class MessageTask:
     """Message task for queue processing."""
 
-    task_type: Literal["content", "status_update", "status_clear"]
+    task_type: Literal["content", "status_update", "status_clear", "thinking_update"]
     text: str | None = None
     window_id: str | None = None
     # content type fields
@@ -80,6 +85,25 @@ _status_msg_info: dict[tuple[int, int], tuple[int, str, str]] = {}
 
 # Flood control: user_id -> monotonic time when ban expires
 _flood_until: dict[int, float] = {}
+
+
+@dataclass
+class ThinkingTurnState:
+    """Accumulated thinking blocks for one turn, edited into a single message."""
+
+    message_id: int  # 0 until the first send succeeds
+    window_id: str
+    blocks: list[str] = field(default_factory=list)  # raw block text, arrival order
+    first_block_at: float = field(default_factory=time.monotonic)
+
+
+# Thinking consolidation: (user_id, thread_id_or_0) -> ThinkingTurnState.
+# Reset via reset_thinking_turn when a new user turn starts.
+_thinking_turns: dict[tuple[int, int], ThinkingTurnState] = {}
+
+# Slack reserved out of MERGE_MAX_LENGTH for the header line + expandable
+# quote formatting overhead (">" per line, "||" suffix, MarkdownV2 escaping).
+_THINKING_BODY_SLACK = 200
 
 # Max seconds to wait for flood control before dropping tasks
 FLOOD_CONTROL_MAX_WAIT = 10
@@ -241,6 +265,8 @@ async def _message_queue_worker(bot: Bot, user_id: int) -> None:
                     await _process_status_update_task(bot, user_id, task)
                 elif task.task_type == "status_clear":
                     await _do_clear_status_message(bot, user_id, task.thread_id or 0)
+                elif task.task_type == "thinking_update":
+                    await _process_thinking_update_task(bot, user_id, task)
             except RetryAfter as e:
                 retry_secs = (
                     e.retry_after
@@ -566,6 +592,123 @@ async def _do_clear_status_message(
             logger.debug(f"Failed to delete status message {msg_id}: {e}")
 
 
+def _strip_expandable_quote(text: str) -> str:
+    """Extract raw content from a sentinel-wrapped expandable quote, if present.
+
+    TranscriptParser wraps each individual thinking block in expandable-quote
+    sentinels before it reaches the queue; consolidation needs the raw text
+    to join multiple blocks into one quote instead of nesting quotes.
+    """
+    start, end = (
+        TranscriptParser.EXPANDABLE_QUOTE_START,
+        TranscriptParser.EXPANDABLE_QUOTE_END,
+    )
+    if text.startswith(start) and text.endswith(end):
+        return text[len(start) : -len(end)]
+    return text
+
+
+def _thinking_body(blocks: list[str], first_block_at: float) -> str:
+    """Build the header + expandable-quote body for a turn's thinking blocks.
+
+    Header reports the TRUE totals (block count, ~tokens, elapsed time) even
+    when content is trimmed to fit. Tokens are estimated as total chars / 4
+    across every block seen this turn, not just the ones kept below. When the
+    joined content would push the message past MERGE_MAX_LENGTH, the OLDEST
+    content is dropped (tail-kept) so the most recent reasoning stays visible.
+    """
+    n = len(blocks)
+    total_chars = sum(len(b) for b in blocks)
+    tokens = total_chars // 4
+    elapsed = max(0.0, time.monotonic() - first_block_at)
+    header = f"🧠 Thinking · {n} blocks · ~{tokens} tok · {elapsed:.0f}s"
+
+    joined = "\n\n".join(blocks)
+    budget = max(0, MERGE_MAX_LENGTH - len(header) - _THINKING_BODY_SLACK)
+    if len(joined) > budget:
+        joined = joined[-budget:] if budget else ""
+
+    quote = f"{TranscriptParser.EXPANDABLE_QUOTE_START}{joined}{TranscriptParser.EXPANDABLE_QUOTE_END}"
+    return f"{header}\n{quote}"
+
+
+async def _process_thinking_update_task(
+    bot: Bot, user_id: int, task: MessageTask
+) -> None:
+    """Consolidate one turn's thinking blocks into a single edited-in-place message.
+
+    Mirrors the status message edit-in-place pattern (_status_msg_info):
+    the first block of a turn sends a new message; each subsequent block
+    edits that same message instead of sending a new one. reset_thinking_turn
+    clears the tracked state so the next turn starts a fresh message.
+    """
+    wid = task.window_id or ""
+    tid = task.thread_id or 0
+    chat_id = session_manager.resolve_chat_id(user_id, task.thread_id)
+    raw = _strip_expandable_quote(task.text or "")
+    if not raw:
+        return
+
+    skey = (user_id, tid)
+    state = _thinking_turns.get(skey)
+    if state is None or state.window_id != wid:
+        state = ThinkingTurnState(message_id=0, window_id=wid)
+    state.blocks.append(raw)
+    body = _thinking_body(state.blocks, state.first_block_at)
+
+    if state.message_id:
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=state.message_id,
+                text=_ensure_formatted(body),
+                parse_mode=PARSE_MODE,
+                link_preview_options=NO_LINK_PREVIEW,
+            )
+            _thinking_turns[skey] = state
+            return
+        except RetryAfter:
+            raise
+        except Exception:
+            try:
+                await bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=state.message_id,
+                    text=strip_sentinels(body),
+                    link_preview_options=NO_LINK_PREVIEW,
+                )
+                _thinking_turns[skey] = state
+                return
+            except RetryAfter:
+                raise
+            except Exception as e:
+                logger.debug(f"Failed to edit thinking message: {e}")
+                # Message might be gone (deleted/too old). Mark it as such
+                # before falling through to send a fresh one below (keeping
+                # the accumulated blocks) — otherwise a failed send-new would
+                # leave state pointing at a message_id we already know is dead.
+                state.message_id = 0
+
+    sent = await send_with_fallback(
+        bot,
+        chat_id,
+        body,
+        **_send_kwargs(task.thread_id),  # type: ignore[arg-type]
+    )
+    if sent:
+        state.message_id = sent.message_id
+        _thinking_turns[skey] = state
+
+
+def reset_thinking_turn(user_id: int, thread_id: int | None = None) -> None:
+    """Clear thinking consolidation state so the next block starts a fresh message.
+
+    Called when a new user turn starts (see bot.handle_new_message) and when a
+    topic is torn down (see handlers.cleanup.clear_topic_state).
+    """
+    _thinking_turns.pop((user_id, thread_id or 0), None)
+
+
 async def _check_and_send_status(
     bot: Bot,
     user_id: int,
@@ -658,6 +801,29 @@ async def enqueue_status_update(
     else:
         task = MessageTask(task_type="status_clear", thread_id=thread_id)
 
+    queue.put_nowait(task)
+
+
+async def enqueue_thinking_update(
+    bot: Bot,
+    user_id: int,
+    window_id: str,
+    text: str,
+    thread_id: int | None = None,
+) -> None:
+    """Enqueue one thinking block for turn-consolidated, edited-in-place display.
+
+    Goes through the same per-user queue as content/status tasks so ordering
+    relative to them is preserved; _process_thinking_update_task does the
+    actual send-or-edit and per-turn accumulation.
+    """
+    queue = get_or_create_queue(bot, user_id)
+    task = MessageTask(
+        task_type="thinking_update",
+        text=text,
+        window_id=window_id,
+        thread_id=thread_id,
+    )
     queue.put_nowait(task)
 
 

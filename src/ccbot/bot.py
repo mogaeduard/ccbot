@@ -116,7 +116,9 @@ from .handlers.message_queue import (
     clear_status_msg_info,
     enqueue_content_message,
     enqueue_status_update,
+    enqueue_thinking_update,
     get_message_queue,
+    reset_thinking_turn,
     shutdown_workers,
 )
 from .handlers.message_sender import (
@@ -1794,28 +1796,57 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
         ):
             continue
 
-        parts = build_response_parts(
-            msg.text,
-            msg.is_complete,
-            msg.content_type,
-            msg.role,
-        )
+        if msg.role == "user" and msg.content_type == "text":
+            # A real user turn just started in the transcript (whether typed
+            # on the Mac or injected by ccbot itself via send_to_window) —
+            # thinking consolidation resets so the next thinking block starts
+            # a fresh message instead of editing the previous turn's.
+            # ponytail: relies on this NewMessage actually being delivered,
+            # i.e. CCBOT_SHOW_USER_MESSAGES staying enabled (current deploy
+            # default). If that ever flips off, move the reset signal into
+            # SessionMonitor's turn buffering instead.
+            reset_thinking_turn(user_id, thread_id)
+            if session_manager.was_recently_injected(wid, msg.text):
+                # Echo of text ccbot itself typed into tmux — the user
+                # already sees it as their own sent Telegram message, so
+                # mirroring it back would show it twice. Messages typed
+                # directly on the Mac terminal were never injected here, so
+                # they still mirror below (with the 👤 prefix).
+                continue
 
         if msg.is_complete:
-            # Enqueue content message task
-            # Note: tool_result editing is handled inside _process_content_task
-            # to ensure sequential processing with tool_use message sending
-            await enqueue_content_message(
-                bot=bot,
-                user_id=user_id,
-                window_id=wid,
-                parts=parts,
-                tool_use_id=msg.tool_use_id,
-                content_type=msg.content_type,
-                text=msg.text,
-                thread_id=thread_id,
-                image_data=msg.image_data,
-            )
+            if msg.content_type == "thinking":
+                # One edited-in-place message per turn instead of one message
+                # per thinking block (Fable-class models think between every
+                # tool call).
+                await enqueue_thinking_update(
+                    bot=bot,
+                    user_id=user_id,
+                    window_id=wid,
+                    text=msg.text,
+                    thread_id=thread_id,
+                )
+            else:
+                parts = build_response_parts(
+                    msg.text,
+                    msg.is_complete,
+                    msg.content_type,
+                    msg.role,
+                )
+                # Enqueue content message task
+                # Note: tool_result editing is handled inside _process_content_task
+                # to ensure sequential processing with tool_use message sending
+                await enqueue_content_message(
+                    bot=bot,
+                    user_id=user_id,
+                    window_id=wid,
+                    parts=parts,
+                    tool_use_id=msg.tool_use_id,
+                    content_type=msg.content_type,
+                    text=msg.text,
+                    thread_id=thread_id,
+                    image_data=msg.image_data,
+                )
 
             # Update user's read offset to current file position
             # This marks these messages as "read" for this user

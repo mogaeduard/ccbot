@@ -1,7 +1,10 @@
 """Tests for SessionManager pure dict operations."""
 
+from unittest.mock import AsyncMock, MagicMock
+
 import pytest
 
+import ccbot.session as session_module
 from ccbot.session import SessionManager
 
 
@@ -155,3 +158,89 @@ class TestIsWindowId:
         assert mgr._is_window_id("@") is False
         assert mgr._is_window_id("") is False
         assert mgr._is_window_id("@abc") is False
+
+
+class TestInjectionEcho:
+    """Echo suppression tracking (fix: ccbot's own tmux injections shouldn't
+    be mirrored back to the user as if they were a second copy of their
+    message — see was_recently_injected / send_to_window)."""
+
+    def test_matches_recent_injection(self, mgr: SessionManager) -> None:
+        mgr._record_injected_text("@1", "hello world")
+        assert mgr.was_recently_injected("@1", "hello world") is True
+
+    def test_no_match_for_different_text(self, mgr: SessionManager) -> None:
+        mgr._record_injected_text("@1", "hello world")
+        assert mgr.was_recently_injected("@1", "something else") is False
+
+    def test_normalizes_whitespace(self, mgr: SessionManager) -> None:
+        """Multi-line / multi-space injected text still matches after
+        normalization (tmux keystroke injection can perturb whitespace)."""
+        mgr._record_injected_text("@1", "hello   world\n\nfoo")
+        assert mgr.was_recently_injected("@1", "hello world foo") is True
+        assert mgr.was_recently_injected("@1", "hello   world\n\nfoo") is True
+
+    def test_per_window_isolation(self, mgr: SessionManager) -> None:
+        mgr._record_injected_text("@1", "hello")
+        assert mgr.was_recently_injected("@2", "hello") is False
+
+    def test_no_injections_returns_false(self, mgr: SessionManager) -> None:
+        assert mgr.was_recently_injected("@99", "anything") is False
+
+    def test_empty_text_never_matches(self, mgr: SessionManager) -> None:
+        mgr._record_injected_text("@1", "   ")
+        assert mgr.was_recently_injected("@1", "") is False
+        assert mgr.was_recently_injected("@1", "   ") is False
+
+    def test_expires_after_echo_window(self, mgr: SessionManager) -> None:
+        mgr._record_injected_text("@1", "hello world")
+        # Simulate the injection having happened just past the echo window.
+        ts, text = mgr._recent_injections["@1"][-1]
+        mgr._recent_injections["@1"][-1] = (
+            ts - mgr._INJECTION_ECHO_WINDOW_SECONDS - 1,
+            text,
+        )
+        assert mgr.was_recently_injected("@1", "hello world") is False
+
+    def test_bounded_history_per_window(self, mgr: SessionManager) -> None:
+        for i in range(mgr._INJECTION_HISTORY_MAXLEN + 5):
+            mgr._record_injected_text("@1", f"msg {i}")
+        assert len(mgr._recent_injections["@1"]) == mgr._INJECTION_HISTORY_MAXLEN
+        # Only the most recent MAXLEN survive.
+        assert mgr.was_recently_injected("@1", "msg 0") is False
+        assert mgr.was_recently_injected("@1", "msg 24") is True
+
+
+class TestSendToWindowRecordsInjection:
+    """send_to_window is the single choke point every text-injection path
+    (typed messages, photo captions, voice transcripts, pending-thread
+    forwards) routes through — recording the echo there covers all of them."""
+
+    @pytest.mark.asyncio
+    async def test_send_to_window_records_text(
+        self, mgr: SessionManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock_window = MagicMock()
+        mock_window.window_id = "@1"
+        mock_tmux = MagicMock()
+        mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+        mock_tmux.send_keys = AsyncMock(return_value=True)
+        monkeypatch.setattr(session_module, "tmux_manager", mock_tmux)
+
+        success, _ = await mgr.send_to_window("@1", "hello there")
+
+        assert success is True
+        assert mgr.was_recently_injected("@1", "hello there") is True
+
+    @pytest.mark.asyncio
+    async def test_missing_window_does_not_record(
+        self, mgr: SessionManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock_tmux = MagicMock()
+        mock_tmux.find_window_by_id = AsyncMock(return_value=None)
+        monkeypatch.setattr(session_module, "tmux_manager", mock_tmux)
+
+        success, _ = await mgr.send_to_window("@1", "hello there")
+
+        assert success is False
+        assert mgr.was_recently_injected("@1", "hello there") is False

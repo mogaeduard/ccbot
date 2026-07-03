@@ -19,12 +19,16 @@ Key methods for thread binding access:
   - resolve_window_for_thread: Get window_id for a user's thread
   - iter_thread_bindings: Generator for iterating all (user_id, thread_id, window_id)
   - find_users_for_session: Find all users bound to a session_id
+  - was_recently_injected: Echo suppression — was this text just typed into
+    the window by send_to_window itself (as opposed to on the Mac terminal)?
 """
 
 import asyncio
 import json
 import logging
 import re
+import time
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from collections.abc import Iterator
@@ -111,8 +115,21 @@ class SessionManager:
     # restored in PR #23.
     group_chat_ids: dict[str, int] = field(default_factory=dict)
 
+    # How long an injection stays "fresh" for echo suppression (see
+    # was_recently_injected). Not persisted — resets on restart, which is
+    # fine since the injection it would be suppressing is also gone by then.
+    _INJECTION_ECHO_WINDOW_SECONDS = 90.0
+    # Bound memory per window regardless of the time window above.
+    _INJECTION_HISTORY_MAXLEN = 20
+
     def __post_init__(self) -> None:
         self._load_state()
+        # window_id -> deque of (monotonic_time, normalized_text) for text
+        # ccbot itself injected via send_to_window. Used by was_recently_injected
+        # to skip re-mirroring the user's own message back to them when the
+        # transcript monitor picks it up (echo suppression). Not a dataclass
+        # field: ephemeral, never persisted to state.json.
+        self._recent_injections: dict[str, deque[tuple[float, str]]] = {}
 
     def _save_state(self) -> None:
         state: dict[str, Any] = {
@@ -811,6 +828,44 @@ class SessionManager:
 
     # --- Tmux helpers ---
 
+    @staticmethod
+    def _normalize_for_echo_compare(text: str) -> str:
+        """Collapse all whitespace runs to single spaces for echo comparison.
+
+        tmux keystroke injection and the transcript's JSONL round-trip can
+        both perturb whitespace slightly; normalizing avoids false negatives.
+        """
+        return " ".join(text.split())
+
+    def _record_injected_text(self, window_id: str, text: str) -> None:
+        """Record text ccbot is about to inject into a window (echo tracking)."""
+        normalized = self._normalize_for_echo_compare(text)
+        if not normalized:
+            return
+        bucket = self._recent_injections.setdefault(
+            window_id, deque(maxlen=self._INJECTION_HISTORY_MAXLEN)
+        )
+        bucket.append((time.monotonic(), normalized))
+
+    def was_recently_injected(self, window_id: str, text: str) -> bool:
+        """Check if `text` matches something ccbot injected into this window recently.
+
+        Used to skip re-mirroring the user's own Telegram message back to them
+        when the transcript monitor picks it up as a "user" entry — without
+        this, the user would see their own words twice. Messages typed
+        directly on the Mac terminal were never injected here, so they're
+        unaffected and still mirror normally. Only injections from the last
+        _INJECTION_ECHO_WINDOW_SECONDS count; whitespace is normalized.
+        """
+        bucket = self._recent_injections.get(window_id)
+        if not bucket:
+            return False
+        normalized = self._normalize_for_echo_compare(text)
+        if not normalized:
+            return False
+        cutoff = time.monotonic() - self._INJECTION_ECHO_WINDOW_SECONDS
+        return any(ts >= cutoff and t == normalized for ts, t in bucket)
+
     async def send_to_window(self, window_id: str, text: str) -> tuple[bool, str]:
         """Send text to a tmux window by ID."""
         display = self.get_display_name(window_id)
@@ -823,6 +878,7 @@ class SessionManager:
         window = await tmux_manager.find_window_by_id(window_id)
         if not window:
             return False, "Window not found (may have been closed)"
+        self._record_injected_text(window_id, text)
         success = await tmux_manager.send_keys(window.window_id, text)
         if success:
             return True, f"Sent to {display}"

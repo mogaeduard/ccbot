@@ -8,12 +8,20 @@ Runs an async polling loop that:
 
 Optimizations: mtime cache skips unchanged files; byte offset avoids re-reading.
 
+Turn-level text buffering: plain assistant "text" entries (mid-turn narration
+like "Let me check the file...") are buffered per session instead of emitted
+immediately — only the most recent one (the turn's actual answer) is flushed,
+either when the next real user message appears or after a short quiet period
+with no new transcript entries (see _apply_turn_buffering / TEXT_FLUSH_QUIET_SECONDS).
+All other content types (thinking, tool_use, tool_result, ...) are unaffected.
+
 Key classes: SessionMonitor, NewMessage, SessionInfo.
 """
 
 import asyncio
 import json
 import logging
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Awaitable
@@ -23,10 +31,22 @@ import aiofiles
 from .config import config
 from .monitor_state import MonitorState, TrackedSession
 from .tmux_manager import tmux_manager
-from .transcript_parser import TranscriptParser
+from .transcript_parser import ParsedEntry, TranscriptParser
 from .utils import read_cwd_from_jsonl
 
 logger = logging.getLogger(__name__)
+
+# How long a session's transcript can go quiet before buffered mid-turn text
+# is flushed anyway (turn-end fallback when no further user message arrives).
+TEXT_FLUSH_QUIET_SECONDS = 3.0
+
+
+@dataclass
+class _PendingText:
+    """Buffered "final answer so far" for a session's in-progress turn."""
+
+    text: str
+    updated_at: float
 
 
 @dataclass
@@ -79,6 +99,9 @@ class SessionMonitor:
         self._message_callback: Callable[[NewMessage], Awaitable[None]] | None = None
         # Per-session pending tool_use state carried across poll cycles
         self._pending_tools: dict[str, dict[str, Any]] = {}  # session_id -> pending
+        # Per-session buffered mid-turn assistant text, carried across poll
+        # cycles (see TEXT_FLUSH_QUIET_SECONDS / _apply_turn_buffering).
+        self._pending_text: dict[str, _PendingText] = {}
         # Track last known session_map for detecting changes
         # Keys may be window_id (@12) or window_name (old format) during transition
         self._last_session_map: dict[str, str] = {}  # window_key -> session_id
@@ -266,6 +289,100 @@ class SessionMonitor:
             logger.error("Error reading session file %s: %s", file_path, e)
         return new_entries
 
+    @staticmethod
+    def _entry_to_new_message(session_id: str, entry: ParsedEntry) -> NewMessage:
+        """Build a NewMessage from a parsed transcript entry."""
+        return NewMessage(
+            session_id=session_id,
+            text=entry.text,
+            is_complete=True,
+            content_type=entry.content_type,
+            tool_use_id=entry.tool_use_id,
+            role=entry.role,
+            tool_name=entry.tool_name,
+            image_data=entry.image_data,
+        )
+
+    def _apply_turn_buffering(
+        self, session_id: str, entries: list[ParsedEntry]
+    ) -> list[ParsedEntry]:
+        """Buffer mid-turn assistant text; only the final text of a turn passes through.
+
+        Claude often narrates between tool calls ("Let me check the file...",
+        "Now I'll fix it...") — only the text right before the turn ends is
+        the actual answer. Each new assistant "text" entry replaces whatever
+        is currently buffered for this session (see _PendingText); a real
+        user "text" entry flushes the buffer first (in-order) so the previous
+        turn's answer is delivered before the new user message, then passes
+        through unchanged. The other turn-end path — a quiet transcript — is
+        handled separately by _flush_stale_pending_text, since it must fire
+        even when this session produced zero new entries this poll cycle.
+
+        Every other content type (thinking, tool_use, tool_result, ...) is
+        untouched and passes straight through. Special case: ExitPlanMode's
+        plan preview is a "text" entry too, but it's UI content immediately
+        followed by its own tool_use entry (see TranscriptParser), not
+        narration — it must render immediately, so it's excluded from
+        buffering via a one-entry lookahead.
+        """
+        result: list[ParsedEntry] = []
+        for i, entry in enumerate(entries):
+            if entry.role == "user" and entry.content_type == "text":
+                pending = self._pending_text.pop(session_id, None)
+                if pending is not None and pending.text:
+                    result.append(
+                        ParsedEntry(
+                            role="assistant", text=pending.text, content_type="text"
+                        )
+                    )
+                result.append(entry)
+                continue
+            if entry.role == "assistant" and entry.content_type == "text":
+                nxt = entries[i + 1] if i + 1 < len(entries) else None
+                if (
+                    nxt is not None
+                    and nxt.content_type == "tool_use"
+                    and nxt.tool_name == "ExitPlanMode"
+                ):
+                    result.append(entry)
+                    continue
+                self._pending_text[session_id] = _PendingText(
+                    text=entry.text, updated_at=time.monotonic()
+                )
+                continue
+            result.append(entry)
+        return result
+
+    def _flush_stale_pending_text(
+        self, *, now: float | None = None
+    ) -> list[tuple[str, ParsedEntry]]:
+        """Flush buffered turn text that's been quiet for TEXT_FLUSH_QUIET_SECONDS.
+
+        Called once per poll tick for ALL sessions with buffered text,
+        independent of whether that session's JSONL file changed this cycle
+        — otherwise a turn's final answer could sit buffered forever once
+        the transcript goes quiet (no next user message ever arrives, e.g.
+        the user reads and moves on). Bounds worst-case delivery delay to
+        ~TEXT_FLUSH_QUIET_SECONDS instead of holding forever.
+        """
+        cutoff_now = now if now is not None else time.monotonic()
+        flushed: list[tuple[str, ParsedEntry]] = []
+        for session_id, pending in list(self._pending_text.items()):
+            if cutoff_now - pending.updated_at >= TEXT_FLUSH_QUIET_SECONDS:
+                del self._pending_text[session_id]
+                if pending.text:
+                    flushed.append(
+                        (
+                            session_id,
+                            ParsedEntry(
+                                role="assistant",
+                                text=pending.text,
+                                content_type="text",
+                            ),
+                        )
+                    )
+        return flushed
+
     async def check_for_updates(self, active_session_ids: set[str]) -> list[NewMessage]:
         """Check all sessions for new assistant messages.
 
@@ -345,6 +462,10 @@ class SessionMonitor:
                 else:
                     self._pending_tools.pop(session_info.session_id, None)
 
+                parsed_entries = self._apply_turn_buffering(
+                    session_info.session_id, parsed_entries
+                )
+
                 for entry in parsed_entries:
                     if not entry.text and not entry.image_data:
                         continue
@@ -352,22 +473,18 @@ class SessionMonitor:
                     if entry.role == "user" and not config.show_user_messages:
                         continue
                     new_messages.append(
-                        NewMessage(
-                            session_id=session_info.session_id,
-                            text=entry.text,
-                            is_complete=True,
-                            content_type=entry.content_type,
-                            tool_use_id=entry.tool_use_id,
-                            role=entry.role,
-                            tool_name=entry.tool_name,
-                            image_data=entry.image_data,
-                        )
+                        self._entry_to_new_message(session_info.session_id, entry)
                     )
 
                 self.state.update_session(tracked)
 
             except OSError as e:
                 logger.debug(f"Error processing session {session_info.session_id}: {e}")
+
+        # Flush any turn text that's gone quiet, regardless of whether its
+        # session had new entries this cycle (see _flush_stale_pending_text).
+        for session_id, entry in self._flush_stale_pending_text():
+            new_messages.append(self._entry_to_new_message(session_id, entry))
 
         self.state.save_if_dirty()
         return new_messages
@@ -417,6 +534,7 @@ class SessionMonitor:
             for session_id in stale_sessions:
                 self.state.remove_session(session_id)
                 self._file_mtimes.pop(session_id, None)
+                self._pending_text.pop(session_id, None)
             self.state.save_if_dirty()
 
     async def _detect_and_cleanup_changes(self) -> dict[str, str]:
@@ -459,6 +577,7 @@ class SessionMonitor:
             for session_id in sessions_to_remove:
                 self.state.remove_session(session_id)
                 self._file_mtimes.pop(session_id, None)
+                self._pending_text.pop(session_id, None)
             self.state.save_if_dirty()
 
         # Update last known map
