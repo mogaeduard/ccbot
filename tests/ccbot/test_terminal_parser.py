@@ -6,6 +6,7 @@ from ccbot.terminal_parser import (
     extract_bash_output,
     extract_interactive_content,
     is_interactive_ui,
+    is_unrecognized_dialog,
     parse_status_line,
     strip_pane_chrome,
 )
@@ -189,6 +190,82 @@ class TestIsInteractiveUI:
 
     def test_false_for_empty_string(self):
         assert is_interactive_ui("") is False
+
+
+# ── is_unrecognized_dialog ───────────────────────────────────────────────
+
+
+class TestIsUnrecognizedDialog:
+    def test_square_corner_box_detected(self):
+        """A closed square-corner box (e.g. `claude --resume` session
+        picker) with no matching UI_PATTERNS is flagged."""
+        pane = (
+            "┌─ Resume Session ──────────────┐\n"
+            "│ 1. feature-branch  2h ago      │\n"
+            "│ 2. main            1d ago      │\n"
+            "└────────────────────────────────┘\n"
+        )
+        assert is_unrecognized_dialog(pane) is True
+
+    def test_rounded_corner_box_detected(self):
+        """Rounded-corner box style (╭╮╰╯) is also detected."""
+        pane = (
+            "╭─ Login ───────────────────╮\n"
+            "│ Visit https://example.com  │\n"
+            "│ Enter code: ABCD-1234      │\n"
+            "╰─────────────────────────────╯\n"
+        )
+        assert is_unrecognized_dialog(pane) is True
+
+    def test_box_with_leading_whitespace_detected(self):
+        pane = "   ┌─ Trust this folder? ─┐\n   │ Yes / No              │\n   └────────────────────────┘\n"
+        assert is_unrecognized_dialog(pane) is True
+
+    def test_no_box_returns_false(self, sample_pane_no_ui: str):
+        assert is_unrecognized_dialog(sample_pane_no_ui) is False
+
+    def test_empty_string_returns_false(self):
+        assert is_unrecognized_dialog("") is False
+
+    def test_normal_chrome_only_returns_false(self, chrome: str):
+        """Claude Code's own chrome uses flat '─' rules, no corner glyphs."""
+        pane = "some output\nmore output\n" + chrome
+        assert is_unrecognized_dialog(pane) is False
+
+    def test_top_border_without_bottom_returns_false(self):
+        """An unpaired top corner alone is not enough — conservative by
+        design (avoid flagging a stray glyph in scrollback text)."""
+        pane = "┌─ Something ─┐\nsome text below, no closing border\n"
+        assert is_unrecognized_dialog(pane) is False
+
+    def test_bottom_border_without_top_returns_false(self):
+        pane = "some text above, no opening border\n└─ Something ─┘\n"
+        assert is_unrecognized_dialog(pane) is False
+
+    def test_bottom_before_top_returns_false(self):
+        """Corner glyphs must pair in top-then-bottom order."""
+        pane = "└─ closing first ─┘\nsome text\n┌─ opening later ─┐\n"
+        assert is_unrecognized_dialog(pane) is False
+
+    @pytest.mark.parametrize(
+        "fixture_name",
+        [
+            "sample_pane_exit_plan",
+            "sample_pane_ask_user_multi_tab",
+            "sample_pane_ask_user_single_tab",
+            "sample_pane_permission",
+            "sample_pane_settings",
+            "sample_pane_status_line",
+        ],
+    )
+    def test_no_false_positive_on_realistic_panes(
+        self, fixture_name: str, request: pytest.FixtureRequest
+    ):
+        """No box-drawn corners in any of these real captures — either a
+        known UI (defers to its own specific handler) or plain status
+        output, neither should ever trip the generic fallback."""
+        pane = request.getfixturevalue(fixture_name)
+        assert is_unrecognized_dialog(pane) is False
 
 
 # ── strip_pane_chrome ───────────────────────────────────────────────────

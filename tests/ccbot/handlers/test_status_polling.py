@@ -147,6 +147,156 @@ class TestStatusPollerSettingsDetection:
 
 
 @pytest.fixture
+def mock_bot_document():
+    bot = AsyncMock()
+    sent_msg = MagicMock()
+    sent_msg.message_id = 888
+    bot.send_document.return_value = sent_msg
+    return bot
+
+
+@pytest.fixture
+def _clear_fallback_state():
+    from ccbot.handlers.dialog_fallback import _fallback_msgs
+
+    _fallback_msgs.clear()
+    yield
+    _fallback_msgs.clear()
+
+
+@pytest.mark.usefixtures("_clear_interactive_state", "_clear_fallback_state")
+class TestStatusPollerUnknownDialogFallback:
+    """The poller's other detector: a full-screen dialog with no specific
+    parser (claude --resume picker, /login, ...) gets screenshotted instead
+    of silently going unnoticed."""
+
+    _DIALOG_PANE = (
+        "┌─ Resume Session ──────────────┐\n"
+        "│ 1. feature-branch  2h ago      │\n"
+        "└────────────────────────────────┘\n"
+    )
+
+    @pytest.mark.asyncio
+    async def test_unknown_dialog_detected_and_screenshot_sent(
+        self, mock_bot_document: AsyncMock
+    ):
+        window_id = "@5"
+        mock_window = MagicMock()
+        mock_window.window_id = window_id
+
+        with (
+            patch("ccbot.handlers.status_polling.tmux_manager") as mock_tmux,
+            patch("ccbot.handlers.dialog_fallback.tmux_manager") as mock_tmux_fb,
+            patch("ccbot.handlers.dialog_fallback.session_manager") as mock_sm,
+            patch(
+                "ccbot.handlers.dialog_fallback.text_to_image",
+                new_callable=AsyncMock,
+                return_value=b"fake-png",
+            ),
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_tmux.capture_pane = AsyncMock(return_value=self._DIALOG_PANE)
+            mock_tmux_fb.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_tmux_fb.capture_pane = AsyncMock(return_value=self._DIALOG_PANE)
+            mock_sm.resolve_chat_id.return_value = 100
+
+            await update_status_message(
+                mock_bot_document, user_id=1, window_id=window_id, thread_id=42
+            )
+
+            mock_bot_document.send_document.assert_called_once()
+            call_kwargs = mock_bot_document.send_document.call_args.kwargs
+            assert call_kwargs["chat_id"] == 100
+            assert call_kwargs["message_thread_id"] == 42
+            assert call_kwargs["reply_markup"] is not None
+
+    @pytest.mark.asyncio
+    async def test_dialog_gone_clears_tracked_screenshot(
+        self, mock_bot_document: AsyncMock
+    ):
+        """Once the dialog disappears, the tracked screenshot message is
+        cleared on the next poll tick (edit-in-place / clear pattern, same
+        as the known-UI path)."""
+        window_id = "@5"
+        mock_window = MagicMock()
+        mock_window.window_id = window_id
+
+        with (
+            patch("ccbot.handlers.status_polling.tmux_manager") as mock_tmux,
+            patch("ccbot.handlers.dialog_fallback.tmux_manager") as mock_tmux_fb,
+            patch("ccbot.handlers.dialog_fallback.session_manager") as mock_sm,
+            patch(
+                "ccbot.handlers.dialog_fallback.text_to_image",
+                new_callable=AsyncMock,
+                return_value=b"fake-png",
+            ),
+        ):
+            mock_tmux_fb.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_sm.resolve_chat_id.return_value = 100
+
+            # Tick 1: dialog present
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_tmux.capture_pane = AsyncMock(return_value=self._DIALOG_PANE)
+            mock_tmux_fb.capture_pane = AsyncMock(return_value=self._DIALOG_PANE)
+            await update_status_message(
+                mock_bot_document, user_id=1, window_id=window_id, thread_id=42
+            )
+            assert mock_bot_document.send_document.call_count == 1
+
+            # Tick 2: dialog gone — normal idle pane
+            idle_pane = (
+                "some output\n"
+                "──────────────────────────────────────\n"
+                "❯ \n"
+                "──────────────────────────────────────\n"
+                "  [Opus 4.6] Context: 50%\n"
+            )
+            mock_tmux.capture_pane = AsyncMock(return_value=idle_pane)
+            mock_tmux_fb.capture_pane = AsyncMock(return_value=idle_pane)
+            await update_status_message(
+                mock_bot_document, user_id=1, window_id=window_id, thread_id=42
+            )
+
+            mock_bot_document.delete_message.assert_called_once_with(
+                chat_id=100, message_id=888
+            )
+
+    @pytest.mark.asyncio
+    async def test_known_ui_takes_priority_over_fallback(
+        self, mock_bot_document: AsyncMock
+    ):
+        """A recognized UI (Settings, permission prompt, ...) must never
+        also trigger the screenshot fallback in the same poll tick."""
+        window_id = "@5"
+        mock_window = MagicMock()
+        mock_window.window_id = window_id
+        permission_pane = (
+            "  Do you want to proceed?\n  Some permission details\n  Esc to cancel\n"
+        )
+
+        with (
+            patch("ccbot.handlers.status_polling.tmux_manager") as mock_tmux,
+            patch(
+                "ccbot.handlers.status_polling.handle_interactive_ui",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            patch(
+                "ccbot.handlers.status_polling.handle_unknown_dialog",
+                new_callable=AsyncMock,
+            ) as mock_fallback,
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_tmux.capture_pane = AsyncMock(return_value=permission_pane)
+
+            await update_status_message(
+                mock_bot_document, user_id=1, window_id=window_id, thread_id=42
+            )
+
+            mock_fallback.assert_not_called()
+
+
+@pytest.fixture
 def mgr(monkeypatch) -> SessionManager:
     """Fresh SessionManager swapped into status_polling's module namespace,
     mirroring the pattern in test_mirror.py — real bind/unbind behavior

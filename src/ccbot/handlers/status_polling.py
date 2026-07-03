@@ -3,6 +3,9 @@
 Provides background polling of terminal status lines for all active users:
   - Detects Claude Code status (working, waiting, etc.)
   - Detects interactive UIs (permission prompts) not triggered via JSONL
+  - Detects full-screen dialogs with no specific parser (claude --resume
+    picker, /login, trust prompts, ...) and posts a screenshot fallback
+    (see dialog_fallback.handle_unknown_dialog)
   - Updates status messages in Telegram
   - Polls thread_bindings (each topic = one window)
   - Periodically probes topic existence via unpin_all_forum_topic_messages
@@ -31,6 +34,11 @@ from ..config import config
 from ..session import session_manager
 from ..terminal_parser import is_interactive_ui, parse_status_line
 from ..tmux_manager import tmux_manager
+from .dialog_fallback import (
+    clear_fallback_msg,
+    get_fallback_msg_id,
+    handle_unknown_dialog,
+)
 from .interactive_ui import (
     clear_interactive_msg,
     get_interactive_window,
@@ -106,6 +114,17 @@ async def update_status_message(
         )
         await handle_interactive_ui(bot, user_id, window_id, thread_id)
         return
+
+    # Fallback: some other full-screen dialog with no specific parser
+    # (claude --resume picker, /login, trust prompts, ...). Also always
+    # checked regardless of skip_status, same reasoning as the known-UI
+    # check above — and clear any stale screenshot once the dialog is gone.
+    if should_check_new_ui:
+        posted = await handle_unknown_dialog(bot, user_id, window_id, thread_id)
+        if posted:
+            return
+        if get_fallback_msg_id(user_id, thread_id) is not None:
+            await clear_fallback_msg(user_id, bot, thread_id)
 
     # Normal status line check — skip if queue is non-empty
     if skip_status:

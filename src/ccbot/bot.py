@@ -5,15 +5,22 @@ Each Telegram topic maps 1:1 to a tmux window (Claude session).
 
 Core responsibilities:
   - Command handlers: /start, /history, /screenshot, /esc, /kill, /unbind,
-    plus forwarding unknown /commands to Claude Code via tmux.
+    /lock, /unlock, plus forwarding unknown /commands to Claude Code via
+    tmux.
   - Callback query handler: directory browser, history pagination,
     interactive UI navigation, screenshot refresh.
   - Topic-based routing: each named topic binds to one tmux window.
     Unbound topics trigger the directory browser to create a new session.
+  - Lock gate: while /lock is active (session_manager.is_locked), a
+    group=-1 handler (lock_gate_handler) drops every inbound update except
+    /unlock before any other handler runs, replying "🔒 locked" at most
+    once a minute. Background loops (status polling, session monitor,
+    mirror) are separate asyncio tasks and keep running untouched.
   - Photo handling: photos sent by user are downloaded and forwarded
     to Claude Code as file paths (photo_handler).
   - Voice handling: voice messages are transcribed via OpenAI API and
-    forwarded as text (voice_handler).
+    held as a Send/Cancel-confirmed pending transcript (voice_handler,
+    _pending_voice) with a 5-minute TTL — see _expire_pending_voice.
   - Phone-created topics: a new forum topic immediately gets a bound
     plain-shell tmux window (topic_created_handler), so the terminal
     exists before the user picks a project — the directory browser and
@@ -42,6 +49,7 @@ import io
 import logging
 import shlex
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from telegram import (
@@ -56,6 +64,7 @@ from telegram.constants import ChatAction
 from telegram.ext import (
     AIORateLimiter,
     Application,
+    ApplicationHandlerStop,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
@@ -110,6 +119,10 @@ from .handlers.directory_browser import (
     clear_window_picker_state,
 )
 from .handlers.cleanup import clear_topic_state
+from .handlers.dialog_fallback import (
+    clear_fallback_msg,
+    handle_unknown_dialog,
+)
 from .handlers.history import send_history
 from .handlers.interactive_ui import (
     INTERACTIVE_TOOL_NAMES,
@@ -361,6 +374,75 @@ async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         if len(trimmed) > 3000:
             trimmed = trimmed[:3000] + "\n... (truncated)"
         await safe_reply(update.message, f"```\n{trimmed}\n```")
+
+
+async def lock_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Engage the lock kill switch: gate every inbound update except /unlock."""
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+    if not update.message:
+        return
+    session_manager.set_locked(True)
+    await safe_reply(update.message, "🔒 Locked. Send /unlock to resume.")
+
+
+async def unlock_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Release the lock kill switch."""
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+    if not update.message:
+        return
+    session_manager.set_locked(False)
+    await safe_reply(update.message, "🔓 Unlocked.")
+
+
+# --- Lock gate: runs before every other handler (see registration in
+# create_bot — group=-1 fires first) ---
+
+_LOCK_REPLY_MIN_INTERVAL_SECONDS = 60.0
+_last_lock_reply_ts: float = 0.0
+
+
+async def lock_gate_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """While locked, swallow every update except /unlock before it reaches
+    any other handler.
+
+    Registered at group=-1 for both message and callback-query updates, so
+    it always runs first; raising ApplicationHandlerStop prevents every
+    later-group handler (text/voice/photo/command/callback) from running at
+    all — none of the terminal-injection call sites ever execute. The
+    "🔒 locked" reply is rate-limited to once a minute so a compromised
+    account can't spam it either. Background loops (status polling, session
+    monitor, mirror) are separate asyncio tasks entirely outside Telegram's
+    update dispatch, so they, and outbound flow generally, are unaffected.
+    """
+    global _last_lock_reply_ts
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id) or not session_manager.is_locked():
+        return
+
+    if update.message and update.message.text:
+        first_word = update.message.text.split(maxsplit=1)[0].split("@")[0]
+        if first_word == "/unlock":
+            return  # let unlock_command handle it normally
+
+    now = time.monotonic()
+    should_reply = now - _last_lock_reply_ts >= _LOCK_REPLY_MIN_INTERVAL_SECONDS
+    if should_reply:
+        _last_lock_reply_ts = now
+
+    if update.callback_query:
+        # Always ack (dismisses the button's loading spinner); only include
+        # the visible alert text within the rate-limit budget.
+        await update.callback_query.answer(
+            "🔒 locked" if should_reply else None, show_alert=should_reply
+        )
+    elif update.message and should_reply:
+        await safe_reply(update.message, "🔒 locked")
+
+    raise ApplicationHandlerStop
 
 
 # --- Screenshot keyboard with quick control keys ---
@@ -792,7 +874,8 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     # Confirm-first: show the transcript with Send/Cancel instead of
     # injecting straight away — an ASR slip must never become a command.
-    _pending_voice[(user.id, thread_id)] = text
+    # A new voice note supersedes any earlier un-actioned one in this topic.
+    await _expire_pending_voice(context.bot, user.id, thread_id)
     keyboard = InlineKeyboardMarkup(
         [
             [
@@ -801,15 +884,66 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             ]
         ]
     )
-    await update.message.reply_text(
+    sent = await update.message.reply_text(
         f'🎤 "{text}"',
         reply_markup=keyboard,
         message_thread_id=thread_id,
     )
+    _set_pending_voice(user.id, thread_id, text, sent.message_id if sent else None)
 
 
-# Pending voice transcripts awaiting Send/Cancel: (user_id, thread_id) → text
-_pending_voice: dict[tuple[int, int], str] = {}
+# Pending voice transcripts awaiting Send/Cancel, keyed by (user_id, thread_id).
+# TTL guards against a Send tapped hours later injecting a stale transcript
+# into whatever the terminal happens to be doing by then.
+_PENDING_VOICE_TTL_SECONDS = 300.0  # 5 minutes
+# Belt-and-braces cap so a burst of un-actioned voice notes can't grow this
+# dict unbounded — oldest entry is dropped to make room.
+_PENDING_VOICE_MAX_ENTRIES = 50
+
+
+@dataclass
+class _PendingVoice:
+    text: str
+    ts: float  # time.monotonic() at creation, for TTL/age checks
+    message_id: int | None  # the "🎤 ..." prompt message, for expiry edits
+
+
+_pending_voice: dict[tuple[int, int], _PendingVoice] = {}
+
+
+def _set_pending_voice(
+    user_id: int, thread_id: int, text: str, message_id: int | None
+) -> None:
+    """Store a new pending voice transcript, evicting the oldest entry first
+    if the dict is at capacity."""
+    if len(_pending_voice) >= _PENDING_VOICE_MAX_ENTRIES:
+        oldest_key = min(_pending_voice, key=lambda k: _pending_voice[k].ts)
+        _pending_voice.pop(oldest_key, None)
+    _pending_voice[(user_id, thread_id)] = _PendingVoice(
+        text=text, ts=time.monotonic(), message_id=message_id
+    )
+
+
+async def _expire_pending_voice(bot: Bot, user_id: int, thread_id: int) -> None:
+    """Drop any pending voice transcript for (user_id, thread_id).
+
+    Best-effort edits its prompt message to show expired — a new voice note
+    or text message in the same topic makes the old "🎤 ..." Send/Cancel
+    prompt stale, so tapping Send on it later must not inject anything.
+    """
+    entry = _pending_voice.pop((user_id, thread_id), None)
+    if entry is None or entry.message_id is None:
+        return
+    chat_id = session_manager.resolve_chat_id(user_id, thread_id)
+    try:
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=entry.message_id,
+            text="🎤 expired — resend the voice note",
+        )
+    except Exception:
+        pass  # message already edited/deleted/too old — entry is dropped regardless
+
 
 # Active bash capture tasks: (user_id, thread_id) → asyncio.Task
 _bash_capture_tasks: dict[tuple[int, int], asyncio.Task[None]] = {}
@@ -1070,6 +1204,11 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     # Cancel any running bash capture — new message pushes pane content down
     _cancel_bash_capture(user.id, thread_id)
 
+    # A new text message supersedes any un-actioned pending voice transcript
+    # in this topic — it's now stale, so tapping its Send later must not
+    # inject anything.
+    await _expire_pending_voice(context.bot, user.id, thread_id)
+
     # Check for pending interactive UI before sending text.
     # This catches UIs (permission prompts, etc.) that status polling might have missed.
     # capture_pane is a local tmux call, but handle_interactive_ui hits the network —
@@ -1291,6 +1430,23 @@ async def _create_and_bind_window(
 # --- Callback query handler ---
 
 
+async def _refresh_interactive_or_fallback(
+    bot: Bot, user_id: int, window_id: str, thread_id: int | None
+) -> None:
+    """After sending a nav key, refresh whichever UI is showing: a known
+    interactive prompt (text, via handle_interactive_ui) or an unrecognized
+    dialog (screenshot, via handle_unknown_dialog) — shared by every
+    CB_ASK_* handler below and its status-poller refresh path, so a
+    keypress inside a --resume picker / /login screen keeps its screenshot
+    in sync exactly like AskUserQuestion does with text.
+    """
+    if await handle_interactive_ui(bot, user_id, window_id, thread_id):
+        return
+    if await handle_unknown_dialog(bot, user_id, window_id, thread_id):
+        return
+    await clear_fallback_msg(user_id, bot, thread_id)
+
+
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if not query or not query.data:
@@ -1501,16 +1657,21 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if tid is None:
             await query.answer("Not in a topic", show_alert=True)
             return
-        text = _pending_voice.pop((user.id, tid), None)
+        entry = _pending_voice.pop((user.id, tid), None)
         if data == CB_VOICE_CANCEL:
             await safe_edit(query, "🎤 Cancelled")
             await query.answer("Cancelled")
             return
-        if text is None:
+        if entry is None:
             await query.answer(
                 "Nothing pending (already sent or expired)", show_alert=True
             )
             return
+        if time.monotonic() - entry.ts > _PENDING_VOICE_TTL_SECONDS:
+            await safe_edit(query, "🎤 expired — resend the voice note")
+            await query.answer("Expired", show_alert=True)
+            return
+        text = entry.text
         wid = session_manager.get_window_for_thread(user.id, tid)
         if wid is None:
             await safe_edit(query, "❌ No terminal bound to this topic anymore")
@@ -1758,7 +1919,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if w:
             await tmux_manager.send_keys(w.window_id, "Up", enter=False, literal=False)
             await asyncio.sleep(0.5)
-            await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
+            await _refresh_interactive_or_fallback(
+                context.bot, user.id, window_id, thread_id
+            )
         await query.answer()
 
     # Interactive UI: Down arrow
@@ -1771,7 +1934,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 w.window_id, "Down", enter=False, literal=False
             )
             await asyncio.sleep(0.5)
-            await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
+            await _refresh_interactive_or_fallback(
+                context.bot, user.id, window_id, thread_id
+            )
         await query.answer()
 
     # Interactive UI: Left arrow
@@ -1784,7 +1949,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 w.window_id, "Left", enter=False, literal=False
             )
             await asyncio.sleep(0.5)
-            await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
+            await _refresh_interactive_or_fallback(
+                context.bot, user.id, window_id, thread_id
+            )
         await query.answer()
 
     # Interactive UI: Right arrow
@@ -1797,7 +1964,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 w.window_id, "Right", enter=False, literal=False
             )
             await asyncio.sleep(0.5)
-            await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
+            await _refresh_interactive_or_fallback(
+                context.bot, user.id, window_id, thread_id
+            )
         await query.answer()
 
     # Interactive UI: Escape
@@ -1810,6 +1979,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 w.window_id, "Escape", enter=False, literal=False
             )
             await clear_interactive_msg(user.id, context.bot, thread_id)
+            await clear_fallback_msg(user.id, context.bot, thread_id)
         await query.answer("⎋ Esc")
 
     # Interactive UI: Enter
@@ -1822,7 +1992,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 w.window_id, "Enter", enter=False, literal=False
             )
             await asyncio.sleep(0.5)
-            await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
+            await _refresh_interactive_or_fallback(
+                context.bot, user.id, window_id, thread_id
+            )
         await query.answer("⏎ Enter")
 
     # Interactive UI: Space
@@ -1835,7 +2007,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 w.window_id, "Space", enter=False, literal=False
             )
             await asyncio.sleep(0.5)
-            await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
+            await _refresh_interactive_or_fallback(
+                context.bot, user.id, window_id, thread_id
+            )
         await query.answer("␣ Space")
 
     # Interactive UI: Tab
@@ -1846,14 +2020,18 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if w:
             await tmux_manager.send_keys(w.window_id, "Tab", enter=False, literal=False)
             await asyncio.sleep(0.5)
-            await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
+            await _refresh_interactive_or_fallback(
+                context.bot, user.id, window_id, thread_id
+            )
         await query.answer("⇥ Tab")
 
     # Interactive UI: refresh display
     elif data.startswith(CB_ASK_REFRESH):
         window_id = data[len(CB_ASK_REFRESH) :]
         thread_id = _get_thread_id(update)
-        await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
+        await _refresh_interactive_or_fallback(
+            context.bot, user.id, window_id, thread_id
+        )
         await query.answer("🔄")
 
     # Screenshot quick keys: send key to tmux window
@@ -2040,6 +2218,8 @@ async def post_init(application: Application) -> None:
         BotCommand("kill", "Kill session and delete topic"),
         BotCommand("unbind", "Unbind topic from session (keeps window running)"),
         BotCommand("usage", "Show Claude Code usage remaining"),
+        BotCommand("lock", "Freeze all inbound control (kill switch)"),
+        BotCommand("unlock", "Release the lock"),
     ]
     # Add Claude Code slash commands
     for cmd_name, desc in CC_COMMANDS.items():
@@ -2131,12 +2311,20 @@ def create_bot() -> Application:
         .build()
     )
 
+    # Lock gate: group=-1 runs before every other handler below. While
+    # locked, it drops the update (raises ApplicationHandlerStop) before any
+    # command/text/voice/photo/callback handler ever sees it.
+    application.add_handler(MessageHandler(filters.ALL, lock_gate_handler), group=-1)
+    application.add_handler(CallbackQueryHandler(lock_gate_handler), group=-1)
+
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("history", history_command))
     application.add_handler(CommandHandler("screenshot", screenshot_command))
     application.add_handler(CommandHandler("esc", esc_command))
     application.add_handler(CommandHandler("unbind", unbind_command))
     application.add_handler(CommandHandler("usage", usage_command))
+    application.add_handler(CommandHandler("lock", lock_command))
+    application.add_handler(CommandHandler("unlock", unlock_command))
     application.add_handler(CallbackQueryHandler(callback_handler))
     # Topic created event — eagerly bind a plain-shell window
     application.add_handler(

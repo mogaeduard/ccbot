@@ -174,10 +174,17 @@ class TestInjectionEcho:
         assert mgr.was_recently_injected("@1", "something else") is False
 
     def test_normalizes_whitespace(self, mgr: SessionManager) -> None:
-        """Multi-line / multi-space injected text still matches after
-        normalization (tmux keystroke injection can perturb whitespace)."""
+        """Multi-space injected text still matches after normalization
+        (tmux keystroke injection can perturb whitespace)."""
         mgr._record_injected_text("@1", "hello   world\n\nfoo")
         assert mgr.was_recently_injected("@1", "hello world foo") is True
+
+    def test_normalizes_whitespace_exact_form(self, mgr: SessionManager) -> None:
+        """Same normalization applies when queried with the original
+        (unnormalized) form — a separate injection so one-shot consumption
+        (see TestEchoOneShotConsumption) doesn't make this a re-test of the
+        same match."""
+        mgr._record_injected_text("@1", "hello   world\n\nfoo")
         assert mgr.was_recently_injected("@1", "hello   world\n\nfoo") is True
 
     def test_per_window_isolation(self, mgr: SessionManager) -> None:
@@ -209,6 +216,41 @@ class TestInjectionEcho:
         # Only the most recent MAXLEN survive.
         assert mgr.was_recently_injected("@1", "msg 0") is False
         assert mgr.was_recently_injected("@1", "msg 24") is True
+
+
+class TestEchoOneShotConsumption:
+    """was_recently_injected consumes the matched entry — one injection can
+    only suppress one transcript echo. Regression coverage for the bug where
+    a user typing the same short word ("yes", "ok") on the Mac within the
+    90s window of sending it from the phone had their Mac message silently
+    swallowed as if it were ccbot's own echo."""
+
+    def test_second_call_with_same_text_is_not_suppressed(
+        self, mgr: SessionManager
+    ) -> None:
+        mgr._record_injected_text("@1", "yes")
+        assert mgr.was_recently_injected("@1", "yes") is True
+        # The matched entry was consumed — a second, genuinely-typed "yes"
+        # (e.g. typed directly on the Mac) must mirror normally, not vanish.
+        assert mgr.was_recently_injected("@1", "yes") is False
+
+    def test_only_the_matching_entry_is_consumed(self, mgr: SessionManager) -> None:
+        mgr._record_injected_text("@1", "yes")
+        mgr._record_injected_text("@1", "no")
+        assert mgr.was_recently_injected("@1", "yes") is True
+        # "no" is untouched — still matches
+        assert mgr.was_recently_injected("@1", "no") is True
+
+    def test_two_injections_of_same_text_each_suppress_once(
+        self, mgr: SessionManager
+    ) -> None:
+        """Two separate injections of the same text (e.g. two Sends of "ok"
+        from the phone) each get their own echo suppressed."""
+        mgr._record_injected_text("@1", "ok")
+        mgr._record_injected_text("@1", "ok")
+        assert mgr.was_recently_injected("@1", "ok") is True
+        assert mgr.was_recently_injected("@1", "ok") is True
+        assert mgr.was_recently_injected("@1", "ok") is False
 
 
 class TestSendToWindowRecordsInjection:
@@ -244,3 +286,77 @@ class TestSendToWindowRecordsInjection:
 
         assert success is False
         assert mgr.was_recently_injected("@1", "hello there") is False
+
+
+class TestLockedState:
+    """/lock kill switch: defaults unlocked, toggles idempotently, and only
+    writes state.json on an actual change (matches set_group_chat_id's
+    write-on-change convention elsewhere in this class)."""
+
+    def test_defaults_unlocked(self, mgr: SessionManager) -> None:
+        assert mgr.is_locked() is False
+
+    def test_set_locked_true(self, mgr: SessionManager) -> None:
+        mgr.set_locked(True)
+        assert mgr.is_locked() is True
+
+    def test_set_locked_false_after_true(self, mgr: SessionManager) -> None:
+        mgr.set_locked(True)
+        mgr.set_locked(False)
+        assert mgr.is_locked() is False
+
+    def test_set_locked_only_saves_on_change(
+        self, mgr: SessionManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        save_calls = []
+        monkeypatch.setattr(mgr, "_save_state", lambda: save_calls.append(1))
+
+        mgr.set_locked(False)  # already False — no-op
+        assert save_calls == []
+
+        mgr.set_locked(True)
+        assert save_calls == [1]
+
+        mgr.set_locked(True)  # already True — no-op
+        assert save_calls == [1]
+
+
+class TestLockedStatePersistence:
+    """Real filesystem round trip: locked survives a fresh SessionManager
+    instance reading the same state.json — i.e. survives a daemon restart."""
+
+    def test_locked_true_survives_reload(
+        self, tmp_path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            session_module.config, "state_file", tmp_path / "state.json"
+        )
+
+        first = SessionManager()
+        first.set_locked(True)
+
+        second = SessionManager()
+        assert second.is_locked() is True
+
+    def test_locked_false_survives_reload(
+        self, tmp_path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            session_module.config, "state_file", tmp_path / "state.json"
+        )
+
+        first = SessionManager()
+        first.set_locked(True)
+        first.set_locked(False)
+
+        second = SessionManager()
+        assert second.is_locked() is False
+
+    def test_no_state_file_defaults_unlocked(
+        self, tmp_path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            session_module.config, "state_file", tmp_path / "state.json"
+        )
+        mgr = SessionManager()
+        assert mgr.is_locked() is False

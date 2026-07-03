@@ -3,7 +3,10 @@
 Wraps libtmux to provide async-friendly operations on a single tmux session:
   - list_windows / find_window_by_name: discover Claude Code windows.
   - capture_pane: read terminal content (plain or with ANSI colors).
-  - send_keys: forward user input or control keys to a window.
+  - send_keys: forward user input or control keys to a window. Multiline
+    literal text is delivered as one bracketed-paste block (see
+    send_keys's _send_literal) instead of raw send-keys -l, which would
+    otherwise treat each embedded newline as its own Enter keystroke.
   - create_window / kill_window: lifecycle management.
 
 All blocking libtmux calls are wrapped in asyncio.to_thread().
@@ -15,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -260,7 +264,30 @@ class TmuxManager:
                     if not pane:
                         logger.error(f"No active pane in window {window_id}")
                         return False
-                    pane.send_keys(chars, enter=False, literal=True)
+                    if "\n" in chars:
+                        # `send-keys -l` feeds raw bytes straight into the
+                        # pty — an embedded '\n' IS an Enter keystroke, so a
+                        # multiline message would submit line-by-line
+                        # instead of arriving as one block (each line is a
+                        # separate shell command / a separate Claude Code
+                        # turn). Route through tmux's paste-buffer with
+                        # bracketed paste (-p) instead: a paste-aware line
+                        # editor (zsh's zle, readline, Claude Code's ink
+                        # TUI) holds off on executing embedded newlines
+                        # until the real Enter _send_enter sends afterward.
+                        # A unique buffer name avoids two concurrent
+                        # multiline sends (different windows) racing on
+                        # tmux's shared default buffer.
+                        buffer_name = f"ccbot-{uuid.uuid4().hex}"
+                        self.server.set_buffer(chars, buffer_name=buffer_name)
+                        pane.paste_buffer(
+                            buffer_name=buffer_name,
+                            bracket=True,
+                            delete_after=True,
+                            linefeed_separator=True,
+                        )
+                    else:
+                        pane.send_keys(chars, enter=False, literal=True)
                     return True
                 except Exception as e:
                     logger.error(f"Failed to send keys to window {window_id}: {e}")

@@ -4,13 +4,17 @@ Parses captured tmux pane content to detect:
   - Interactive UIs (AskUserQuestion, ExitPlanMode, Permission Prompt,
     RestoreCheckpoint) via regex-based UIPattern matching with top/bottom
     delimiters.
+  - Unrecognized dialogs: a conservative fallback for full-screen dialogs
+    with no specific parser (claude --resume picker, /login, trust
+    prompts, ...) — see is_unrecognized_dialog().
   - Status line (spinner characters + working text) by scanning from bottom up.
 
 All Claude Code text patterns live here. To support a new UI type or
 a changed Claude Code version, edit UI_PATTERNS / STATUS_SPINNERS.
 
 Key functions: is_interactive_ui(), extract_interactive_content(),
-parse_status_line(), strip_pane_chrome(), extract_bash_output().
+is_unrecognized_dialog(), parse_status_line(), strip_pane_chrome(),
+extract_bash_output().
 """
 
 import re
@@ -191,6 +195,57 @@ def extract_interactive_content(pane_text: str) -> InteractiveUIContent | None:
 def is_interactive_ui(pane_text: str) -> bool:
     """Check if terminal currently shows an interactive UI."""
     return extract_interactive_content(pane_text) is not None
+
+
+# ── Unrecognized dialog fallback ─────────────────────────────────────────
+#
+# Detects a full-screen dialog ccbot has no specific parser for (the
+# `claude --resume` picker, `/login`, a trust-this-directory prompt, ...).
+# Deliberately conservative — a false positive means posting a needless
+# screenshot for an ordinary Claude Code screen, which is more disruptive
+# than occasionally missing an exotic prompt, so this only fires on a
+# strong, low-noise signal: a *closed* box-drawn border (a top corner line
+# followed by a matching bottom corner line further down). Claude Code's
+# own chrome (see strip_pane_chrome / _RE_LONG_DASH) only ever uses flat
+# '─' rules with no corner glyphs, so a paired corner border reliably means
+# some other full-screen TUI element is drawing its own box.
+
+_BOX_TOP_LEFT = "┌╭"
+_BOX_TOP_RIGHT = "┐╮"
+_BOX_BOTTOM_LEFT = "└╰"
+_BOX_BOTTOM_RIGHT = "┘╯"
+
+
+def _is_box_top(line: str) -> bool:
+    s = line.strip()
+    return len(s) >= 2 and s[0] in _BOX_TOP_LEFT and s[-1] in _BOX_TOP_RIGHT
+
+
+def _is_box_bottom(line: str) -> bool:
+    s = line.strip()
+    return len(s) >= 2 and s[0] in _BOX_BOTTOM_LEFT and s[-1] in _BOX_BOTTOM_RIGHT
+
+
+def is_unrecognized_dialog(pane_text: str) -> bool:
+    """True if the pane shows a full-screen dialog with no specific parser.
+
+    Only fires when no known UI_PATTERNS match (is_interactive_ui already
+    covers AskUserQuestion/ExitPlanMode/Permission/etc. — those get their
+    normal, specific handling) AND the pane contains a closed box-drawn
+    border: a line starting with a top-left/top-right corner glyph followed,
+    somewhere below, by a line starting with a bottom-left/bottom-right
+    corner glyph.
+    """
+    if not pane_text:
+        return False
+    if is_interactive_ui(pane_text):
+        return False  # already has a specific handler
+
+    lines = pane_text.strip().split("\n")
+    top_idx = next((i for i, ln in enumerate(lines) if _is_box_top(ln)), None)
+    if top_idx is None:
+        return False
+    return any(_is_box_bottom(ln) for ln in lines[top_idx + 1 :])
 
 
 # ── Status line parsing ─────────────────────────────────────────────────

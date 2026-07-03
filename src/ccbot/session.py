@@ -13,6 +13,7 @@ Responsibilities:
   - Send keystrokes to tmux windows and retrieve message history.
   - Maintain window_id→display name mapping for UI display.
   - Re-resolve stale window IDs on startup (tmux server restart recovery).
+  - Hold the /lock kill switch (persisted; see is_locked/set_locked).
 
 Key class: SessionManager (singleton instantiated as `session_manager`).
 Key methods for thread binding access:
@@ -21,6 +22,8 @@ Key methods for thread binding access:
   - find_users_for_session: Find all users bound to a session_id
   - was_recently_injected: Echo suppression — was this text just typed into
     the window by send_to_window itself (as opposed to on the Mac terminal)?
+    One-shot: a match is consumed so it can only suppress one echo.
+  - is_locked / set_locked: /lock kill switch for inbound updates.
 """
 
 import asyncio
@@ -98,6 +101,8 @@ class SessionManager:
     thread_bindings: user_id -> {thread_id -> window_id}
     window_display_names: window_id -> window_name (for display)
     group_chat_ids: "user_id:thread_id" -> group chat_id (for supergroup routing)
+    locked: /lock kill switch — while True, bot.py's lock gate drops every
+      inbound update except /unlock before it reaches any handler.
     """
 
     window_states: dict[str, WindowState] = field(default_factory=dict)
@@ -114,6 +119,9 @@ class SessionManager:
     # History: originally added in 5afc111, erroneously removed in 26cb81f,
     # restored in PR #23.
     group_chat_ids: dict[str, int] = field(default_factory=dict)
+    # /lock kill switch (see is_locked/set_locked). Persisted so a locked
+    # bot stays locked across a daemon restart.
+    locked: bool = False
 
     # How long an injection stays "fresh" for echo suppression (see
     # was_recently_injected). Not persisted — resets on restart, which is
@@ -143,6 +151,7 @@ class SessionManager:
             },
             "window_display_names": self.window_display_names,
             "group_chat_ids": self.group_chat_ids,
+            "locked": self.locked,
         }
         atomic_write_json(config.state_file, state)
         logger.debug("State saved to %s", config.state_file)
@@ -176,6 +185,7 @@ class SessionManager:
                 self.group_chat_ids = {
                     k: int(v) for k, v in state.get("group_chat_ids", {}).items()
                 }
+                self.locked = bool(state.get("locked", False))
 
                 # Detect old format: keys that don't look like window IDs
                 needs_migration = False
@@ -206,6 +216,7 @@ class SessionManager:
                 self.thread_bindings = {}
                 self.window_display_names = {}
                 self.group_chat_ids = {}
+                self.locked = False
                 pass
 
     async def resolve_stale_ids(self) -> None:
@@ -430,6 +441,19 @@ class SessionManager:
             self.window_states[window_id].window_name = new_name
         self._save_state()
         logger.info("Updated display name: window_id %s -> '%s'", window_id, new_name)
+
+    # --- Lock kill switch (/lock, /unlock) ---
+
+    def is_locked(self) -> bool:
+        """True while /lock is active — inbound updates are gated in bot.py."""
+        return self.locked
+
+    def set_locked(self, value: bool) -> None:
+        """Set the lock state and persist it (survives a daemon restart)."""
+        if self.locked != value:
+            self.locked = value
+            self._save_state()
+            logger.info("Lock state changed: locked=%s", value)
 
     # --- Group chat ID management (supergroup forum topic routing) ---
 
@@ -856,6 +880,12 @@ class SessionManager:
         directly on the Mac terminal were never injected here, so they're
         unaffected and still mirror normally. Only injections from the last
         _INJECTION_ECHO_WINDOW_SECONDS count; whitespace is normalized.
+
+        One-shot: a matched entry is removed from the deque so it can only
+        suppress a single transcript echo. One injection produces exactly
+        one transcript entry, so without this a short phrase ("yes", "ok")
+        typed on the Mac within the echo window of an equal phrase sent from
+        the phone would be silently swallowed as if it were the echo.
         """
         bucket = self._recent_injections.get(window_id)
         if not bucket:
@@ -864,7 +894,11 @@ class SessionManager:
         if not normalized:
             return False
         cutoff = time.monotonic() - self._INJECTION_ECHO_WINDOW_SECONDS
-        return any(ts >= cutoff and t == normalized for ts, t in bucket)
+        for i, (ts, t) in enumerate(bucket):
+            if ts >= cutoff and t == normalized:
+                del bucket[i]
+                return True
+        return False
 
     async def send_to_window(self, window_id: str, text: str) -> tuple[bool, str]:
         """Send text to a tmux window by ID."""
