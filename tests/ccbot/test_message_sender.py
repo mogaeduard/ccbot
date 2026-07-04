@@ -45,6 +45,16 @@ class TestIsThreadDeletedError:
         assert not is_thread_deleted_error(RetryAfter(5))
         assert not is_thread_deleted_error(ValueError("message thread not found"))
 
+    def test_matches_topic_id_invalid(self) -> None:
+        """editForumTopic on a deleted topic raises this — see
+        status_polling.py's active deletion probe."""
+        assert is_thread_deleted_error(BadRequest("Bad Request: TOPIC_ID_INVALID"))
+
+    def test_other_topic_error_does_not_match(self) -> None:
+        assert not is_thread_deleted_error(
+            BadRequest("Bad Request: TOPIC_NAME_INVALID")
+        )
+
 
 @pytest.fixture
 def mgr(monkeypatch) -> SessionManager:

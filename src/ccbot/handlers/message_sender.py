@@ -40,10 +40,17 @@ logger = logging.getLogger(__name__)
 
 
 def is_thread_deleted_error(exc: BaseException) -> bool:
-    """True if exc is Telegram's error for sending into a deleted forum topic."""
-    return (
-        isinstance(exc, BadRequest) and "message thread not found" in str(exc).lower()
-    )
+    """True if exc is Telegram's error for a dead forum topic.
+
+    Covers both known error strings: "message thread not found" (send-message
+    paths — sendMessage et al on a deleted thread) and "TOPIC_ID_INVALID"
+    (editForumTopic on a deleted thread — see status_polling.py's active
+    deletion probe, the only Bot API call found that actually validates
+    thread liveness)."""
+    if not isinstance(exc, BadRequest):
+        return False
+    msg = str(exc).lower()
+    return "message thread not found" in msg or "topic_id_invalid" in msg
 
 
 async def cleanup_deleted_thread(chat_id: int, thread_id: int) -> None:

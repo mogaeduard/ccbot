@@ -10,12 +10,17 @@ Provides background polling of terminal status lines for all active users:
   - Polls thread_bindings (each topic = one window)
   - Active deletion probe: Telegram fires no event when a forum topic is
     deleted, so an idle topic (nothing ever sent into it) would otherwise
-    never be noticed as gone. Each tick, round-robins a few of the most
-    overdue bindings through a cheap TYPING chat action (skipping any
-    binding that already got one recently via the "sustained typing while
-    working" path below — that counts as probed too); Telegram's "message
-    thread not found" on that call means the topic is gone, so the window
-    is killed and the binding unbound (see _probe_topic).
+    never be noticed as gone. send_chat_action and unpinAllForumTopicMessages
+    both return ok=True even for deleted/invalid thread ids — neither
+    validates anything. The only validating call found is editForumTopic:
+    renaming a topic to the name ccbot already tracks for it (topic_titles'
+    last ai-title rename, else the session's tracked display name) succeeds
+    silently when the topic is live (a no-op if the name is unchanged) and
+    raises BadRequest "TOPIC_ID_INVALID" when it's gone. Each tick,
+    round-robins a few of the most overdue bindings through that edit call
+    (see _probe_topic); on TOPIC_ID_INVALID the window is killed and the
+    binding unbound via cleanup_deleted_thread — same cleanup any other
+    deleted-topic detection uses.
   - Dead-window (window gone, binding stale) cleanup: only runs here when
     the auto-topic mirror (mirror.py) is disabled. When the mirror is
     enabled it owns this job (also deletes the now-orphaned forum topic,
@@ -41,6 +46,7 @@ from telegram import Bot
 from telegram.constants import ChatAction
 from telegram.error import BadRequest
 
+from .. import topic_titles
 from ..config import config
 from ..session import session_manager
 from ..terminal_parser import is_interactive_ui, parse_status_line
@@ -57,7 +63,7 @@ from .interactive_ui import (
 )
 from .cleanup import clear_topic_state
 from .message_queue import enqueue_status_update, get_message_queue
-from .message_sender import is_thread_deleted_error
+from .message_sender import cleanup_deleted_thread, is_thread_deleted_error
 
 logger = logging.getLogger(__name__)
 
@@ -79,14 +85,16 @@ PROBE_BATCH_SIZE = 3
 TYPING_ACTION_INTERVAL = 4.0  # seconds
 
 # Last time a typing action was sent per bound topic: (user_id, thread_id) ->
-# time.monotonic(). Popped on unbind below; a few stray entries from topics
-# closed via other cleanup paths (bot.py, mirror.py) are harmless floats.
+# time.monotonic(). Purely cosmetic (the "working" indicator) — does NOT
+# count toward the deletion probe below; send_chat_action never validates
+# thread liveness, so it proves nothing about whether the topic still
+# exists. Popped on unbind below; a few stray entries from topics closed
+# via other cleanup paths (bot.py, mirror.py) are harmless floats.
 # ponytail: no cross-module wiring into cleanup.clear_topic_state — would
 # create a status_polling<->cleanup circular import for one float per topic.
 _last_typing_sent: dict[tuple[int, int], float] = {}
 
-# Last time a binding was actively probed for deletion (idle path only —
-# see _last_typing_sent above for the "working" path, which also counts).
+# Last time a binding was actively probed for deletion via editForumTopic.
 _last_probed: dict[tuple[int, int], float] = {}
 
 
@@ -123,26 +131,50 @@ async def _maybe_send_typing(bot: Bot, user_id: int, thread_id: int) -> None:
     await _send_typing_action(bot, user_id, thread_id)
 
 
-async def _probe_topic(bot: Bot, user_id: int, thread_id: int, window_id: str) -> None:
-    """Active deletion probe for an idle topic: send a TYPING action purely
-    to check the topic still exists. On "message thread not found", kill the
-    bound window and unbind — same cleanup as any other dead-binding path.
-    A phantom brief "typing…" flash in an idle topic is an acceptable
-    side effect of reusing the same chat action as the real indicator.
+def _tracked_topic_name(window_id: str) -> str:
+    """Name to send with the probe's editForumTopic call, so a live topic
+    gets a true no-op edit. Priority: topic_titles' own last-attempted name
+    (set on ai-title renames) else the session's tracked display name —
+    which is exactly the "N — name" string mirror.py stored via bind_thread
+    when it first created the topic (get_display_name falls back to the
+    window_id itself if nothing was ever stored — still a harmless, valid
+    string for probing purposes).
     """
-    if await _send_typing_action(bot, user_id, thread_id):
+    return topic_titles._last_set_name.get(
+        window_id
+    ) or session_manager.get_display_name(window_id)
+
+
+async def _probe_topic(bot: Bot, user_id: int, thread_id: int, window_id: str) -> None:
+    """Active deletion probe for an idle topic: edit the topic's title to
+    the name ccbot already tracks for it. This is the only Bot API call
+    found that validates the topic still exists — see module docstring.
+    On "TOPIC_ID_INVALID", kill the bound window and unbind — same cleanup
+    as any other dead-binding path.
+    """
+    chat_id = session_manager.resolve_chat_id(user_id, thread_id)
+    try:
+        await bot.edit_forum_topic(
+            chat_id=chat_id,
+            message_thread_id=thread_id,
+            name=_tracked_topic_name(window_id),
+        )
         return
-    w = await tmux_manager.find_window_by_id(window_id)
-    if w:
-        await tmux_manager.kill_window(w.window_id)
-    session_manager.unbind_thread(user_id, thread_id)
-    await clear_topic_state(user_id, thread_id, bot)
+    except BadRequest as e:
+        if not is_thread_deleted_error(e):
+            logger.debug("Probe failed for thread %d: %s", thread_id, e)
+            return
+    except Exception as e:
+        logger.debug("Probe failed for thread %d: %s", thread_id, e)
+        return
+
+    await cleanup_deleted_thread(chat_id, thread_id)
     _last_typing_sent.pop((user_id, thread_id), None)
     _last_probed.pop((user_id, thread_id), None)
     logger.info(
-        "Probe: topic deleted — killed window_id '%s' and unbound thread %d for user %d",
-        window_id,
+        "Probe: topic deleted — cleaned up thread %d (window_id '%s') for user %d",
         thread_id,
+        window_id,
         user_id,
     )
 
@@ -240,21 +272,11 @@ async def update_status_message(
 
 
 def _due_for_probe(now: float) -> list[tuple[int, int, str]]:
-    """Bindings due for an active deletion probe, oldest-probed-first.
-
-    A binding that already got a typing action recently (the "sustained
-    typing while working" path) counts as probed too — no need to send a
-    second one just to check existence.
-    """
+    """Bindings due for an active deletion probe, oldest-probed-first."""
     due = [
         (user_id, thread_id, wid)
         for user_id, thread_id, wid in session_manager.iter_thread_bindings()
-        if now
-        - max(
-            _last_probed.get((user_id, thread_id), 0.0),
-            _last_typing_sent.get((user_id, thread_id), 0.0),
-        )
-        >= PROBE_INTERVAL
+        if now - _last_probed.get((user_id, thread_id), 0.0) >= PROBE_INTERVAL
     ]
     due.sort(key=lambda t: _last_probed.get((t[0], t[1]), 0.0))
     return due[:PROBE_BATCH_SIZE]

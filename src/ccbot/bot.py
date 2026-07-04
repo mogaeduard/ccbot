@@ -547,6 +547,74 @@ async def wake_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await safe_reply(update.message, "☀️ Awake — pings back on")
 
 
+def _mute_status_text() -> str:
+    """Current mute state, read straight from the flag files (source of
+    truth for the external pager script too)."""
+    mac = (
+        "🔇 Mac sounds muted"
+        if (ccbot_dir() / "mute-mac").exists()
+        else "🔊 Mac sounds on"
+    )
+    phone = (
+        "phone pings muted"
+        if (ccbot_dir() / "mute-phone").exists()
+        else "phone pings on"
+    )
+    return f"{mac} · {phone}"
+
+
+def _parse_mute_arg(text: str) -> str | None:
+    """Parse the optional mac|phone argument. Returns None if invalid."""
+    parts = text.split(maxsplit=1)
+    arg = parts[1].strip().lower() if len(parts) > 1 else ""
+    return arg if arg in ("", "mac", "phone") else None
+
+
+async def mute_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/mute [mac|phone]: touch a flag file in ccbot_dir() that the external
+    pager script (~/.claude/notify-pager.sh) checks before playing a Mac
+    sound / sending a Telegram DM. No argument mutes both channels."""
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+    if not update.message:
+        return
+
+    arg = _parse_mute_arg(update.message.text or "")
+    if arg is None:
+        await safe_reply(update.message, "❌ Usage: /mute [mac|phone]")
+        return
+
+    ccbot_dir().mkdir(parents=True, exist_ok=True)
+    if arg in ("", "mac"):
+        (ccbot_dir() / "mute-mac").touch()
+    if arg in ("", "phone"):
+        (ccbot_dir() / "mute-phone").touch()
+
+    await safe_reply(update.message, _mute_status_text())
+
+
+async def unmute_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/unmute [mac|phone]: reverse of /mute. No argument unmutes both."""
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+    if not update.message:
+        return
+
+    arg = _parse_mute_arg(update.message.text or "")
+    if arg is None:
+        await safe_reply(update.message, "❌ Usage: /unmute [mac|phone]")
+        return
+
+    if arg in ("", "mac"):
+        (ccbot_dir() / "mute-mac").unlink(missing_ok=True)
+    if arg in ("", "phone"):
+        (ccbot_dir() / "mute-phone").unlink(missing_ok=True)
+
+    await safe_reply(update.message, _mute_status_text())
+
+
 # /killall confirmation TTL and pending state (see callback_handler's
 # CB_KILLALL_CONFIRM/CANCEL branch). Keyed by user_id -> time.monotonic()
 # of the prompt — single-user bot, but keyed defensively rather than a bare
@@ -2822,6 +2890,8 @@ async def post_init(application: Application) -> None:
         BotCommand("grab", "Send a file from the terminal's cwd"),
         BotCommand("sleep", "Arm overnight-autonomy quiet hours"),
         BotCommand("wake", "Disarm quiet hours + morning report"),
+        BotCommand("mute", "Mute notifications [mac|phone]"),
+        BotCommand("unmute", "Unmute notifications [mac|phone]"),
         BotCommand("lock", "Freeze all inbound control (kill switch)"),
         BotCommand("unlock", "Release the lock"),
         BotCommand("killall", "Panic button: kill every session"),
@@ -2979,6 +3049,8 @@ def create_bot() -> Application:
     application.add_handler(CommandHandler("unlock", unlock_command))
     application.add_handler(CommandHandler("sleep", sleep_command))
     application.add_handler(CommandHandler("wake", wake_command))
+    application.add_handler(CommandHandler("mute", mute_command))
+    application.add_handler(CommandHandler("unmute", unmute_command))
     application.add_handler(CommandHandler("killall", killall_command))
     application.add_handler(CommandHandler("grab", grab_command))
     application.add_handler(CommandHandler("speak", speak_command))

@@ -357,50 +357,52 @@ class TestStatusPollLoopDeadWindowCleanup:
 
 @pytest.fixture
 def _clear_probe_state():
-    """BUG 2: (user_id, thread_id) probe/typing timestamps are module-level
-    dicts — reset around each test so cadence tests don't see leftovers."""
+    """(user_id, thread_id) probe/typing timestamps and topic_titles' name
+    cache are module-level state — reset around each test so cadence/name
+    tests don't see leftovers from other tests."""
     status_polling._last_probed.clear()
     status_polling._last_typing_sent.clear()
+    status_polling.topic_titles._last_set_name.clear()
     yield
     status_polling._last_probed.clear()
     status_polling._last_typing_sent.clear()
+    status_polling.topic_titles._last_set_name.clear()
 
 
 @pytest.mark.usefixtures("_clear_probe_state")
 class TestActiveDeletionProbe:
-    """BUG 2: an idle topic's deletion is never noticed by the send-failure
-    path (nothing is ever sent into it), so a round-robin TYPING-action
-    probe must catch it independently — see status_polling.py's module
-    docstring and _probe_topic/_due_for_probe."""
+    """An idle topic's deletion is never noticed by the send-failure path
+    (nothing is ever sent into it), so a round-robin probe must catch it
+    independently — see status_polling.py's module docstring and
+    _probe_topic/_due_for_probe.
+
+    The probe uses editForumTopic: it's the only Bot API call that
+    validates thread liveness (send_chat_action and
+    unpinAllForumTopicMessages both return ok=True on deleted/invalid
+    thread ids — verified live against the real Telegram API)."""
 
     @pytest.mark.asyncio
-    async def test_probe_raising_thread_not_found_kills_and_unbinds(
+    async def test_probe_topic_id_invalid_cleans_up(
         self, monkeypatch, mgr: SessionManager, mock_bot: AsyncMock
     ) -> None:
         from telegram.error import BadRequest
 
         mgr.bind_thread(1, 42, "@0", window_name="proj")
-        mock_bot.send_chat_action = AsyncMock(
-            side_effect=BadRequest("Bad Request: message thread not found")
+        mock_bot.edit_forum_topic = AsyncMock(
+            side_effect=BadRequest("Bad Request: TOPIC_ID_INVALID")
         )
-        mock_window = MagicMock()
-        mock_window.window_id = "@0"
 
-        with (
-            patch("ccbot.handlers.status_polling.tmux_manager") as mock_tmux,
-            patch(
-                "ccbot.handlers.status_polling.clear_topic_state",
-                new_callable=AsyncMock,
-            ) as mock_cleanup,
-        ):
-            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
-            mock_tmux.kill_window = AsyncMock(return_value=True)
-
+        with patch(
+            "ccbot.handlers.status_polling.cleanup_deleted_thread",
+            new_callable=AsyncMock,
+        ) as mock_cleanup:
             await status_polling._probe_topic(mock_bot, 1, 42, "@0")
 
-            mock_tmux.kill_window.assert_awaited_once_with("@0")
-            mock_cleanup.assert_awaited_once_with(1, 42, mock_bot)
-        assert mgr.get_window_for_thread(1, 42) is None
+            # chat_id resolves to the user_id fallback (no group chat set).
+            mock_cleanup.assert_awaited_once_with(1, 42)
+        mock_bot.edit_forum_topic.assert_awaited_once_with(
+            chat_id=1, message_thread_id=42, name="proj"
+        )
 
     @pytest.mark.asyncio
     async def test_healthy_binding_untouched(
@@ -409,13 +411,51 @@ class TestActiveDeletionProbe:
         mgr.bind_thread(1, 42, "@0", window_name="proj")
 
         with patch(
-            "ccbot.handlers.status_polling.clear_topic_state",
+            "ccbot.handlers.status_polling.cleanup_deleted_thread",
             new_callable=AsyncMock,
         ) as mock_cleanup:
             await status_polling._probe_topic(mock_bot, 1, 42, "@0")
 
             mock_cleanup.assert_not_called()
-        mock_bot.send_chat_action.assert_awaited_once()
+        mock_bot.edit_forum_topic.assert_awaited_once_with(
+            chat_id=1, message_thread_id=42, name="proj"
+        )
+        assert mgr.get_window_for_thread(1, 42) == "@0"
+
+    @pytest.mark.asyncio
+    async def test_probe_prefers_ai_title_over_display_name(
+        self, monkeypatch, mgr: SessionManager, mock_bot: AsyncMock
+    ) -> None:
+        """topic_titles._last_set_name (an ai-title rename) takes priority
+        over the plain mirror-created display name."""
+        mgr.bind_thread(1, 42, "@0", window_name="1 — proj")
+        status_polling.topic_titles._last_set_name["@0"] = "1 — Fix login bug"
+
+        await status_polling._probe_topic(mock_bot, 1, 42, "@0")
+
+        mock_bot.edit_forum_topic.assert_awaited_once_with(
+            chat_id=1, message_thread_id=42, name="1 — Fix login bug"
+        )
+
+    @pytest.mark.asyncio
+    async def test_other_bad_request_does_not_clean_up(
+        self, monkeypatch, mgr: SessionManager, mock_bot: AsyncMock
+    ) -> None:
+        """A BadRequest unrelated to thread deletion must not trigger cleanup."""
+        from telegram.error import BadRequest
+
+        mgr.bind_thread(1, 42, "@0", window_name="proj")
+        mock_bot.edit_forum_topic = AsyncMock(
+            side_effect=BadRequest("Bad Request: TOPIC_NAME_INVALID")
+        )
+
+        with patch(
+            "ccbot.handlers.status_polling.cleanup_deleted_thread",
+            new_callable=AsyncMock,
+        ) as mock_cleanup:
+            await status_polling._probe_topic(mock_bot, 1, 42, "@0")
+
+            mock_cleanup.assert_not_called()
         assert mgr.get_window_for_thread(1, 42) == "@0"
 
     def test_rate_budget_caps_bindings_per_tick(self, mgr: SessionManager) -> None:
@@ -443,16 +483,17 @@ class TestActiveDeletionProbe:
 
         assert [t[1] for t in due] == [1, 3, 2]
 
-    def test_recent_typing_action_counts_as_probed(self, mgr: SessionManager) -> None:
-        """A window that just got a 'sustained typing while working' action
-        is skipped this tick — no need to double-probe it."""
+    def test_typing_action_does_not_count_as_probed(self, mgr: SessionManager) -> None:
+        """Unlike the old design, a recent typing action must NOT exempt a
+        binding from probing — send_chat_action proves nothing about topic
+        liveness, so the probe (editForumTopic) still has to run."""
         mgr.bind_thread(1, 42, "@0", window_name="proj")
         now = 10_000.0
         status_polling._last_typing_sent[(1, 42)] = now - 1  # just sent
 
         due = status_polling._due_for_probe(now)
 
-        assert due == []
+        assert due == [(1, 42, "@0")]
 
     def test_never_probed_binding_is_immediately_due(self, mgr: SessionManager) -> None:
         mgr.bind_thread(1, 42, "@0", window_name="proj")
