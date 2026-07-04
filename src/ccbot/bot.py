@@ -528,6 +528,7 @@ async def sleep_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     quiet_until_file = ccbot_dir() / "quiet-until"
     quiet_until_file.parent.mkdir(parents=True, exist_ok=True)
     quiet_until_file.write_text(str(int(wake.timestamp())))
+    (ccbot_dir() / "quiet-override").unlink(missing_ok=True)
     overnight_arm()
 
     await safe_reply(update.message, f"😴 Quiet until {wake.strftime('%H:%M')}")
@@ -550,6 +551,22 @@ async def wake_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await safe_reply(update.message, "☀️ Awake — pings back on")
 
 
+# /unmute pierces the pager's quiet gates (dynamic quiet-until + the static
+# night window) for this many hours — self-expiring, so the next night's
+# quiet hours work again without any action. Written as an epoch to
+# ~/.ccbot/quiet-override; /mute and /sleep delete it (explicit silence wins).
+_QUIET_OVERRIDE_HOURS = 8
+
+
+def _quiet_override_epoch() -> int | None:
+    """Active quiet-override expiry epoch, or None if absent/expired."""
+    try:
+        epoch = int((ccbot_dir() / "quiet-override").read_text().strip())
+    except (OSError, ValueError):
+        return None
+    return epoch if epoch > time.time() else None
+
+
 def _mute_status_text() -> str:
     """Current mute state, read straight from the flag files (source of
     truth for the external pager script too)."""
@@ -563,7 +580,12 @@ def _mute_status_text() -> str:
         if (ccbot_dir() / "mute-phone").exists()
         else "phone pings on"
     )
-    return f"{mac} · {phone}"
+    text = f"{mac} · {phone}"
+    override = _quiet_override_epoch()
+    if override is not None:
+        until = datetime.fromtimestamp(override).strftime("%H:%M")
+        text += f"\n🔓 Quiet-hours override active until {until}"
+    return text
 
 
 def _parse_mute_arg(text: str) -> str | None:
@@ -593,6 +615,8 @@ async def mute_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         (ccbot_dir() / "mute-mac").touch()
     if arg in ("", "phone"):
         (ccbot_dir() / "mute-phone").touch()
+    # Explicit mute cancels any earlier /unmute quiet-hours override.
+    (ccbot_dir() / "quiet-override").unlink(missing_ok=True)
 
     await safe_reply(update.message, _mute_status_text())
 
@@ -614,6 +638,14 @@ async def unmute_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         (ccbot_dir() / "mute-mac").unlink(missing_ok=True)
     if arg in ("", "phone"):
         (ccbot_dir() / "mute-phone").unlink(missing_ok=True)
+    # Unmute must mean unmute: pierce the pager's quiet gates (dynamic
+    # quiet-until AND the static night window) for the next few hours.
+    # Self-expires so tomorrow night's quiet hours still apply.
+    ccbot_dir().mkdir(parents=True, exist_ok=True)
+    (ccbot_dir() / "quiet-until").unlink(missing_ok=True)
+    (ccbot_dir() / "quiet-override").write_text(
+        str(int(time.time() + _QUIET_OVERRIDE_HOURS * 3600))
+    )
 
     await safe_reply(update.message, _mute_status_text())
 

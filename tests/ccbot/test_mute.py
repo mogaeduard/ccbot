@@ -145,3 +145,53 @@ class TestUnmuteCommand:
             await unmute_command(update, _make_context())
         reply_text = update.message.reply_text.call_args.args[0]
         assert "Usage" in reply_text
+
+
+class TestQuietOverride:
+    """/unmute must pierce quiet hours; /mute and /sleep must cancel that."""
+
+    @pytest.mark.asyncio
+    async def test_unmute_writes_override_and_clears_quiet_until(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        monkeypatch.setenv("CCBOT_DIR", str(tmp_path))
+        (tmp_path / "quiet-until").write_text("9999999999")
+        update = _make_update("/unmute")
+        with (
+            patch("ccbot.bot.is_user_allowed", return_value=True),
+            patch("ccbot.bot.safe_reply", new_callable=AsyncMock),
+        ):
+            await unmute_command(update, _make_context())
+        assert not (tmp_path / "quiet-until").exists()
+        override = int((tmp_path / "quiet-override").read_text())
+        import time as _time
+
+        assert override > _time.time() + 3600  # comfortably in the future
+
+    @pytest.mark.asyncio
+    async def test_mute_cancels_override(self, monkeypatch, tmp_path) -> None:
+        monkeypatch.setenv("CCBOT_DIR", str(tmp_path))
+        (tmp_path / "quiet-override").write_text("9999999999")
+        update = _make_update("/mute")
+        with (
+            patch("ccbot.bot.is_user_allowed", return_value=True),
+            patch("ccbot.bot.safe_reply", new_callable=AsyncMock),
+        ):
+            await mute_command(update, _make_context())
+        assert not (tmp_path / "quiet-override").exists()
+
+    @pytest.mark.asyncio
+    async def test_sleep_cancels_override(self, monkeypatch, tmp_path) -> None:
+        monkeypatch.setenv("CCBOT_DIR", str(tmp_path))
+        (tmp_path / "quiet-override").write_text("9999999999")
+        from ccbot.bot import sleep_command
+
+        update = _make_update("/sleep 09:15")
+        with (
+            patch("ccbot.bot.is_user_allowed", return_value=True),
+            patch("ccbot.bot.safe_reply", new_callable=AsyncMock),
+            patch("ccbot.bot.overnight_arm"),
+        ):
+            await sleep_command(update, _make_context())
+        assert not (tmp_path / "quiet-override").exists()
+        assert (tmp_path / "quiet-until").exists()
