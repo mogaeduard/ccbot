@@ -8,9 +8,14 @@ Provides background polling of terminal status lines for all active users:
     (see dialog_fallback.handle_unknown_dialog)
   - Updates status messages in Telegram
   - Polls thread_bindings (each topic = one window)
-  - Periodically probes topic existence via unpin_all_forum_topic_messages
-    (silent no-op when no pins); cleans up deleted topics (kills tmux window
-    + unbinds thread)
+  - Active deletion probe: Telegram fires no event when a forum topic is
+    deleted, so an idle topic (nothing ever sent into it) would otherwise
+    never be noticed as gone. Each tick, round-robins a few of the most
+    overdue bindings through a cheap TYPING chat action (skipping any
+    binding that already got one recently via the "sustained typing while
+    working" path below — that counts as probed too); Telegram's "message
+    thread not found" on that call means the topic is gone, so the window
+    is killed and the binding unbound (see _probe_topic).
   - Dead-window (window gone, binding stale) cleanup: only runs here when
     the auto-topic mirror (mirror.py) is disabled. When the mirror is
     enabled it owns this job (also deletes the now-orphaned forum topic,
@@ -21,7 +26,8 @@ Provides background polling of terminal status lines for all active users:
 
 Key components:
   - STATUS_POLL_INTERVAL: Polling frequency (1 second)
-  - TOPIC_CHECK_INTERVAL: Topic existence probe frequency (60 seconds)
+  - PROBE_INTERVAL: every binding gets an active deletion probe at least this often
+  - PROBE_BATCH_SIZE: max probe sends per tick (rate budget)
   - TYPING_ACTION_INTERVAL: Typing-indicator re-fire cadence (4 seconds)
   - status_poll_loop: Background polling task
   - update_status_message: Poll and enqueue status updates
@@ -51,14 +57,22 @@ from .interactive_ui import (
 )
 from .cleanup import clear_topic_state
 from .message_queue import enqueue_status_update, get_message_queue
+from .message_sender import is_thread_deleted_error
 
 logger = logging.getLogger(__name__)
 
 # Status polling interval
 STATUS_POLL_INTERVAL = 1.0  # seconds - faster response (rate limiting at send layer)
 
-# Topic existence probe interval
-TOPIC_CHECK_INTERVAL = 60.0  # seconds
+# Every bound topic gets an active deletion probe at least this often.
+PROBE_INTERVAL = 60.0  # seconds
+
+# Max probe sends per STATUS_POLL_INTERVAL tick — spreads probing across
+# ticks (round-robin, oldest-probed-first) instead of bursting all bindings
+# at once every PROBE_INTERVAL.
+# ponytail: fixed small batch; raise if the binding count grows enough that
+# PROBE_BATCH_SIZE * (PROBE_INTERVAL / STATUS_POLL_INTERVAL) can't cover it.
+PROBE_BATCH_SIZE = 3
 
 # Typing-indicator re-fire cadence — Telegram auto-expires "typing" after ~5s,
 # so re-send well before that while a window is working.
@@ -71,6 +85,32 @@ TYPING_ACTION_INTERVAL = 4.0  # seconds
 # create a status_polling<->cleanup circular import for one float per topic.
 _last_typing_sent: dict[tuple[int, int], float] = {}
 
+# Last time a binding was actively probed for deletion (idle path only —
+# see _last_typing_sent above for the "working" path, which also counts).
+_last_probed: dict[tuple[int, int], float] = {}
+
+
+async def _send_typing_action(bot: Bot, user_id: int, thread_id: int) -> bool:
+    """Send a TYPING chat action. Returns False if it failed because the
+    topic is gone (Telegram's "message thread not found"); True otherwise
+    (success or any other transient error, which isn't this call's job to
+    diagnose)."""
+    try:
+        await bot.send_chat_action(
+            chat_id=session_manager.resolve_chat_id(user_id, thread_id),
+            message_thread_id=thread_id,
+            action=ChatAction.TYPING,
+        )
+        return True
+    except BadRequest as e:
+        if is_thread_deleted_error(e):
+            return False
+        logger.debug("Typing action failed for thread %d: %s", thread_id, e)
+        return True
+    except Exception as e:
+        logger.debug("Typing action failed for thread %d: %s", thread_id, e)
+        return True
+
 
 async def _maybe_send_typing(bot: Bot, user_id: int, thread_id: int) -> None:
     """Sustain Telegram's typing indicator while a window is working, capped
@@ -80,14 +120,31 @@ async def _maybe_send_typing(bot: Bot, user_id: int, thread_id: int) -> None:
     if now - _last_typing_sent.get(key, 0.0) < TYPING_ACTION_INTERVAL:
         return
     _last_typing_sent[key] = now
-    try:
-        await bot.send_chat_action(
-            chat_id=session_manager.resolve_chat_id(user_id, thread_id),
-            message_thread_id=thread_id,
-            action=ChatAction.TYPING,
-        )
-    except Exception as e:
-        logger.debug("Typing indicator failed for thread %d: %s", thread_id, e)
+    await _send_typing_action(bot, user_id, thread_id)
+
+
+async def _probe_topic(bot: Bot, user_id: int, thread_id: int, window_id: str) -> None:
+    """Active deletion probe for an idle topic: send a TYPING action purely
+    to check the topic still exists. On "message thread not found", kill the
+    bound window and unbind — same cleanup as any other dead-binding path.
+    A phantom brief "typing…" flash in an idle topic is an acceptable
+    side effect of reusing the same chat action as the real indicator.
+    """
+    if await _send_typing_action(bot, user_id, thread_id):
+        return
+    w = await tmux_manager.find_window_by_id(window_id)
+    if w:
+        await tmux_manager.kill_window(w.window_id)
+    session_manager.unbind_thread(user_id, thread_id)
+    await clear_topic_state(user_id, thread_id, bot)
+    _last_typing_sent.pop((user_id, thread_id), None)
+    _last_probed.pop((user_id, thread_id), None)
+    logger.info(
+        "Probe: topic deleted — killed window_id '%s' and unbound thread %d for user %d",
+        window_id,
+        thread_id,
+        user_id,
+    )
 
 
 async def update_status_message(
@@ -182,52 +239,41 @@ async def update_status_message(
     # If no status line, keep existing status message (don't clear on transient state)
 
 
+def _due_for_probe(now: float) -> list[tuple[int, int, str]]:
+    """Bindings due for an active deletion probe, oldest-probed-first.
+
+    A binding that already got a typing action recently (the "sustained
+    typing while working" path) counts as probed too — no need to send a
+    second one just to check existence.
+    """
+    due = [
+        (user_id, thread_id, wid)
+        for user_id, thread_id, wid in session_manager.iter_thread_bindings()
+        if now
+        - max(
+            _last_probed.get((user_id, thread_id), 0.0),
+            _last_typing_sent.get((user_id, thread_id), 0.0),
+        )
+        >= PROBE_INTERVAL
+    ]
+    due.sort(key=lambda t: _last_probed.get((t[0], t[1]), 0.0))
+    return due[:PROBE_BATCH_SIZE]
+
+
 async def status_poll_loop(bot: Bot) -> None:
     """Background task to poll terminal status for all thread-bound windows."""
     logger.info("Status polling started (interval: %ss)", STATUS_POLL_INTERVAL)
-    last_topic_check = 0.0
     while True:
         try:
-            # Periodic topic existence probe
+            # Active deletion probe: round-robin a rate-limited batch of the
+            # most-overdue bindings every tick (see _due_for_probe).
             now = time.monotonic()
-            if now - last_topic_check >= TOPIC_CHECK_INTERVAL:
-                last_topic_check = now
-                for user_id, thread_id, wid in list(
-                    session_manager.iter_thread_bindings()
-                ):
-                    try:
-                        await bot.unpin_all_forum_topic_messages(
-                            chat_id=session_manager.resolve_chat_id(user_id, thread_id),
-                            message_thread_id=thread_id,
-                        )
-                    except BadRequest as e:
-                        if "Topic_id_invalid" in str(e):
-                            # Topic deleted — kill window, unbind, and clean up state
-                            w = await tmux_manager.find_window_by_id(wid)
-                            if w:
-                                await tmux_manager.kill_window(w.window_id)
-                            session_manager.unbind_thread(user_id, thread_id)
-                            await clear_topic_state(user_id, thread_id, bot)
-                            _last_typing_sent.pop((user_id, thread_id), None)
-                            logger.info(
-                                "Topic deleted: killed window_id '%s' and "
-                                "unbound thread %d for user %d",
-                                wid,
-                                thread_id,
-                                user_id,
-                            )
-                        else:
-                            logger.debug(
-                                "Topic probe error for %s: %s",
-                                wid,
-                                e,
-                            )
-                    except Exception as e:
-                        logger.debug(
-                            "Topic probe error for %s: %s",
-                            wid,
-                            e,
-                        )
+            for user_id, thread_id, wid in _due_for_probe(now):
+                _last_probed[(user_id, thread_id)] = now
+                try:
+                    await _probe_topic(bot, user_id, thread_id, wid)
+                except Exception as e:
+                    logger.debug("Probe error for thread %d: %s", thread_id, e)
 
             for user_id, thread_id, wid in list(session_manager.iter_thread_bindings()):
                 try:

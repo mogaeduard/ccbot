@@ -151,7 +151,7 @@ def mock_bot_document():
     bot = AsyncMock()
     sent_msg = MagicMock()
     sent_msg.message_id = 888
-    bot.send_document.return_value = sent_msg
+    bot.send_message.return_value = sent_msg
     return bot
 
 
@@ -167,8 +167,8 @@ def _clear_fallback_state():
 @pytest.mark.usefixtures("_clear_interactive_state", "_clear_fallback_state")
 class TestStatusPollerUnknownDialogFallback:
     """The poller's other detector: a full-screen dialog with no specific
-    parser (claude --resume picker, /login, ...) gets screenshotted instead
-    of silently going unnoticed."""
+    parser (claude --resume picker, /login, ...) gets posted as a text code
+    block instead of silently going unnoticed."""
 
     _DIALOG_PANE = (
         "┌─ Resume Session ──────────────┐\n"
@@ -177,7 +177,7 @@ class TestStatusPollerUnknownDialogFallback:
     )
 
     @pytest.mark.asyncio
-    async def test_unknown_dialog_detected_and_screenshot_sent(
+    async def test_unknown_dialog_detected_and_text_sent(
         self, mock_bot_document: AsyncMock
     ):
         window_id = "@5"
@@ -188,11 +188,6 @@ class TestStatusPollerUnknownDialogFallback:
             patch("ccbot.handlers.status_polling.tmux_manager") as mock_tmux,
             patch("ccbot.handlers.dialog_fallback.tmux_manager") as mock_tmux_fb,
             patch("ccbot.handlers.dialog_fallback.session_manager") as mock_sm,
-            patch(
-                "ccbot.handlers.dialog_fallback.text_to_image",
-                new_callable=AsyncMock,
-                return_value=b"fake-png",
-            ),
         ):
             mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
             mock_tmux.capture_pane = AsyncMock(return_value=self._DIALOG_PANE)
@@ -204,11 +199,12 @@ class TestStatusPollerUnknownDialogFallback:
                 mock_bot_document, user_id=1, window_id=window_id, thread_id=42
             )
 
-            mock_bot_document.send_document.assert_called_once()
-            call_kwargs = mock_bot_document.send_document.call_args.kwargs
+            mock_bot_document.send_message.assert_called_once()
+            call_kwargs = mock_bot_document.send_message.call_args.kwargs
             assert call_kwargs["chat_id"] == 100
             assert call_kwargs["message_thread_id"] == 42
             assert call_kwargs["reply_markup"] is not None
+            assert "Resume Session" in call_kwargs["text"]
 
     @pytest.mark.asyncio
     async def test_dialog_gone_clears_tracked_screenshot(
@@ -225,11 +221,6 @@ class TestStatusPollerUnknownDialogFallback:
             patch("ccbot.handlers.status_polling.tmux_manager") as mock_tmux,
             patch("ccbot.handlers.dialog_fallback.tmux_manager") as mock_tmux_fb,
             patch("ccbot.handlers.dialog_fallback.session_manager") as mock_sm,
-            patch(
-                "ccbot.handlers.dialog_fallback.text_to_image",
-                new_callable=AsyncMock,
-                return_value=b"fake-png",
-            ),
         ):
             mock_tmux_fb.find_window_by_id = AsyncMock(return_value=mock_window)
             mock_sm.resolve_chat_id.return_value = 100
@@ -241,7 +232,7 @@ class TestStatusPollerUnknownDialogFallback:
             await update_status_message(
                 mock_bot_document, user_id=1, window_id=window_id, thread_id=42
             )
-            assert mock_bot_document.send_document.call_count == 1
+            assert mock_bot_document.send_message.call_count == 1
 
             # Tick 2: dialog gone — normal idle pane
             idle_pane = (
@@ -362,3 +353,110 @@ class TestStatusPollLoopDeadWindowCleanup:
 
             mock_cleanup.assert_awaited_once_with(1, 42, mock_bot)
             assert mgr.get_window_for_thread(1, 42) is None
+
+
+@pytest.fixture
+def _clear_probe_state():
+    """BUG 2: (user_id, thread_id) probe/typing timestamps are module-level
+    dicts — reset around each test so cadence tests don't see leftovers."""
+    status_polling._last_probed.clear()
+    status_polling._last_typing_sent.clear()
+    yield
+    status_polling._last_probed.clear()
+    status_polling._last_typing_sent.clear()
+
+
+@pytest.mark.usefixtures("_clear_probe_state")
+class TestActiveDeletionProbe:
+    """BUG 2: an idle topic's deletion is never noticed by the send-failure
+    path (nothing is ever sent into it), so a round-robin TYPING-action
+    probe must catch it independently — see status_polling.py's module
+    docstring and _probe_topic/_due_for_probe."""
+
+    @pytest.mark.asyncio
+    async def test_probe_raising_thread_not_found_kills_and_unbinds(
+        self, monkeypatch, mgr: SessionManager, mock_bot: AsyncMock
+    ) -> None:
+        from telegram.error import BadRequest
+
+        mgr.bind_thread(1, 42, "@0", window_name="proj")
+        mock_bot.send_chat_action = AsyncMock(
+            side_effect=BadRequest("Bad Request: message thread not found")
+        )
+        mock_window = MagicMock()
+        mock_window.window_id = "@0"
+
+        with (
+            patch("ccbot.handlers.status_polling.tmux_manager") as mock_tmux,
+            patch(
+                "ccbot.handlers.status_polling.clear_topic_state",
+                new_callable=AsyncMock,
+            ) as mock_cleanup,
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_tmux.kill_window = AsyncMock(return_value=True)
+
+            await status_polling._probe_topic(mock_bot, 1, 42, "@0")
+
+            mock_tmux.kill_window.assert_awaited_once_with("@0")
+            mock_cleanup.assert_awaited_once_with(1, 42, mock_bot)
+        assert mgr.get_window_for_thread(1, 42) is None
+
+    @pytest.mark.asyncio
+    async def test_healthy_binding_untouched(
+        self, monkeypatch, mgr: SessionManager, mock_bot: AsyncMock
+    ) -> None:
+        mgr.bind_thread(1, 42, "@0", window_name="proj")
+
+        with patch(
+            "ccbot.handlers.status_polling.clear_topic_state",
+            new_callable=AsyncMock,
+        ) as mock_cleanup:
+            await status_polling._probe_topic(mock_bot, 1, 42, "@0")
+
+            mock_cleanup.assert_not_called()
+        mock_bot.send_chat_action.assert_awaited_once()
+        assert mgr.get_window_for_thread(1, 42) == "@0"
+
+    def test_rate_budget_caps_bindings_per_tick(self, mgr: SessionManager) -> None:
+        """More bindings than PROBE_BATCH_SIZE are due at once — only a
+        capped batch goes out this tick; the rest wait for the next one."""
+        for i in range(status_polling.PROBE_BATCH_SIZE + 5):
+            mgr.bind_thread(1, i, f"@{i}", window_name="proj")
+
+        due = status_polling._due_for_probe(now=10_000.0)
+
+        assert len(due) == status_polling.PROBE_BATCH_SIZE
+
+    def test_due_selection_is_oldest_probed_first(self, mgr: SessionManager) -> None:
+        mgr.bind_thread(1, 1, "@1", window_name="a")
+        mgr.bind_thread(1, 2, "@2", window_name="b")
+        mgr.bind_thread(1, 3, "@3", window_name="c")
+        now = 10_000.0
+        # thread 1: never probed (oldest, 0.0). thread 3: probed a while ago.
+        # thread 2: probed more recently than 3, but both are still overdue.
+        status_polling._last_probed[(1, 1)] = 0.0
+        status_polling._last_probed[(1, 3)] = now - status_polling.PROBE_INTERVAL - 50
+        status_polling._last_probed[(1, 2)] = now - status_polling.PROBE_INTERVAL - 1
+
+        due = status_polling._due_for_probe(now)
+
+        assert [t[1] for t in due] == [1, 3, 2]
+
+    def test_recent_typing_action_counts_as_probed(self, mgr: SessionManager) -> None:
+        """A window that just got a 'sustained typing while working' action
+        is skipped this tick — no need to double-probe it."""
+        mgr.bind_thread(1, 42, "@0", window_name="proj")
+        now = 10_000.0
+        status_polling._last_typing_sent[(1, 42)] = now - 1  # just sent
+
+        due = status_polling._due_for_probe(now)
+
+        assert due == []
+
+    def test_never_probed_binding_is_immediately_due(self, mgr: SessionManager) -> None:
+        mgr.bind_thread(1, 42, "@0", window_name="proj")
+
+        due = status_polling._due_for_probe(now=10_000.0)
+
+        assert due == [(1, 42, "@0")]
