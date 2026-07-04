@@ -194,6 +194,37 @@ class TestCloseDeadTopics:
         cleanup_mock.assert_awaited_once_with(user_id, 42, bot)
 
     @pytest.mark.asyncio
+    async def test_closes_phantom_placeholder_binding(
+        self, monkeypatch, mgr, bot
+    ) -> None:
+        """BUG 1 regression: a phantom topic somehow bound to the __main__
+        placeholder's window_id (@0) must get cleaned up by this same
+        reconciliation, exactly like any other dead binding — no hand-delete
+        needed. tmux_manager.list_windows() always excludes the placeholder
+        by name/index (see test_tmux_manager.py), so from mirror_tick's
+        point of view @0 is indistinguishable from a truly-dead window even
+        though the real tmux window is alive and well; the OTHER live
+        window (@1) proves this isn't just "no windows at all"."""
+        user_id = mirror._mirror_user_id()
+        mgr.set_group_chat_id(user_id, 42, config.mirror_chat_id)
+        mgr.bind_thread(user_id, 42, "@0", window_name="__main__")
+        monkeypatch.setattr(
+            mirror.tmux_manager,
+            "list_windows",
+            AsyncMock(return_value=[_window(window_id="@1", window_name="proj")]),
+        )
+        cleanup_mock = AsyncMock()
+        monkeypatch.setattr(mirror, "clear_topic_state", cleanup_mock)
+
+        await mirror.mirror_tick(bot)
+
+        bot.delete_forum_topic.assert_awaited_once_with(
+            chat_id=config.mirror_chat_id, message_thread_id=42
+        )
+        assert mgr.get_window_for_thread(user_id, 42) is None
+        cleanup_mock.assert_awaited_once_with(user_id, 42, bot)
+
+    @pytest.mark.asyncio
     async def test_closes_phone_created_binding_too(
         self, monkeypatch, mgr, bot
     ) -> None:

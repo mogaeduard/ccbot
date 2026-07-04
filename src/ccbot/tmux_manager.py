@@ -71,18 +71,46 @@ class TmuxManager:
         session = self.get_session()
         if session:
             self._scrub_session_env(session)
+            self._ensure_main_window_placement(session)
             return session
 
-        # Create new session with main window named specifically
+        # Create new session with the main (placeholder) window named in the
+        # same `tmux new-session -n` call that creates it — not a separate
+        # rename_window() call afterward. A separate call would leave a real
+        # gap (default-named window, briefly un-skippable by
+        # list_windows()'s name check) that a concurrently-running mirror
+        # poll tick could see and create a phantom topic for.
         session = self.server.new_session(
             session_name=self.session_name,
             start_directory=str(Path.home()),
+            window_name=config.tmux_main_window_name,
         )
-        # Rename the default window to the main window name
-        if session.windows:
-            session.windows[0].rename_window(config.tmux_main_window_name)
+        self._ensure_main_window_placement(session)
         self._scrub_session_env(session)
         return session
+
+    @staticmethod
+    def _ensure_main_window_placement(session: libtmux.Session) -> None:
+        """Keep the __main__ placeholder parked at window index 0.
+
+        base-index is 1, so a freshly-created session's lone window lands at
+        index 1 — the same slot a real terminal (zshrc's _cc_tab) would want
+        for "terminal 1". Move the placeholder to 0 (always free, never used
+        for real work) so real windows start numbering at 1. Self-heals: run
+        on every get_or_create_session() call, so a placeholder left over
+        from before this fix (still sitting at index 1) gets moved the next
+        time any window is created or the daemon restarts.
+        """
+        for window in session.windows:
+            if (
+                window.window_name == config.tmux_main_window_name
+                and window.window_index != "0"
+            ):
+                try:
+                    window.move_window(destination="0")
+                except Exception as e:
+                    logger.debug("Failed to move placeholder window to index 0: %s", e)
+                break
 
     @staticmethod
     def _scrub_session_env(session: libtmux.Session) -> None:
@@ -113,8 +141,12 @@ class TmuxManager:
 
             for window in session.windows:
                 name = window.window_name or ""
-                # Skip the main window (placeholder window)
-                if name == config.tmux_main_window_name:
+                # Skip the main window (placeholder window). Checked by name
+                # (the normal case) and by index 0 (belt-and-suspenders: that
+                # slot is reserved for the placeholder — see
+                # _ensure_main_window_placement — so it's excluded even if
+                # something external renamed the window away from "__main__").
+                if name == config.tmux_main_window_name or window.window_index == "0":
                     continue
 
                 try:

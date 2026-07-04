@@ -101,11 +101,135 @@ class TestSendKeysLiteralBranch:
         assert names[0] != names[1]
 
 
+class TestListWindowsSkipsPlaceholder:
+    """Mocked: list_windows() must exclude the __main__ placeholder both by
+    name (the normal case) and by index 0 (belt-and-suspenders — index 0 is
+    reserved for the placeholder, see get_or_create_session's
+    _ensure_main_window_placement, so it's excluded even if something
+    external renamed the window away from "__main__")."""
+
+    @staticmethod
+    def _mock_window(window_id: str, name: str, index: str) -> MagicMock:
+        w = MagicMock()
+        w.window_id = window_id
+        w.window_name = name
+        w.window_index = index
+        w.active_pane.pane_current_path = "/tmp"
+        w.active_pane.pane_current_command = "zsh"
+        return w
+
+    @pytest.mark.asyncio
+    async def test_skips_by_name(self) -> None:
+        tm = TmuxManager(session_name="ccbot")
+        mock_session = MagicMock()
+        mock_session.windows = [
+            self._mock_window("@0", "__main__", "0"),
+            self._mock_window("@1", "proj", "1"),
+        ]
+        with patch.object(tm, "get_session", return_value=mock_session):
+            windows = await tm.list_windows()
+        assert [w.window_name for w in windows] == ["proj"]
+
+    @pytest.mark.asyncio
+    async def test_skips_by_index_even_if_renamed(self) -> None:
+        tm = TmuxManager(session_name="ccbot")
+        mock_session = MagicMock()
+        mock_session.windows = [
+            self._mock_window("@0", "renamed-somehow", "0"),
+            self._mock_window("@1", "proj", "1"),
+        ]
+        with patch.object(tm, "get_session", return_value=mock_session):
+            windows = await tm.list_windows()
+        assert [w.window_name for w in windows] == ["proj"]
+
+
 TMUX_SOCKET = "batchtest"
 
 
 def _tmux_available() -> bool:
     return shutil.which("tmux") is not None
+
+
+PLACEHOLDER_SOCKET = "placeholder_test"
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not _tmux_available(), reason="tmux binary not available")
+class TestMainWindowPlacement:
+    """BUG 1 regression: the __main__ placeholder must never occupy the slot
+    a real terminal would want (index 1, the same as base-index), and must
+    never leak into list_windows() — mirror.py's topic-creation relies on
+    that to skip it and never make a phantom Telegram topic for it.
+
+    Uses a real, isolated tmux server (never the default socket, killed
+    after) since these are libtmux `move-window`/`new-session -n` behaviors
+    worth proving against the real binary, not mocks. Relies on this
+    machine's ~/.tmux.conf `base-index 1` (loaded by any new tmux server by
+    default, any socket) matching production — see TestSendKeysMultilineRealTmux
+    above for the same real-server pattern.
+    """
+
+    @pytest.fixture
+    def server(self):
+        import libtmux
+
+        srv = libtmux.Server(socket_name=PLACEHOLDER_SOCKET)
+        with contextlib.suppress(Exception):
+            srv.kill()
+        yield srv
+        with contextlib.suppress(Exception):
+            srv.kill()
+
+    def test_fresh_session_placeholder_at_index_0(self, server) -> None:
+        tm = TmuxManager(session_name="ccbot")
+        tm._server = server
+
+        session = tm.get_or_create_session()
+
+        assert session.windows[0].window_name == "__main__"
+        assert session.windows[0].window_index == "0"
+
+    def test_real_window_after_placeholder_starts_at_index_1(self, server) -> None:
+        tm = TmuxManager(session_name="ccbot")
+        tm._server = server
+        tm.get_or_create_session()
+
+        session = tm.get_session()
+        w = session.new_window(window_name="proj")
+
+        assert w.window_index == "1"
+
+    @pytest.mark.asyncio
+    async def test_placeholder_excluded_from_list_windows(self, server) -> None:
+        tm = TmuxManager(session_name="ccbot")
+        tm._server = server
+        tm.get_or_create_session()
+        session = tm.get_session()
+        session.new_window(window_name="proj")
+
+        windows = await tm.list_windows()
+
+        assert [w.window_name for w in windows] == ["proj"]
+        assert all(w.window_id != "@0" for w in windows)
+
+    def test_self_heals_stale_placeholder_at_index_1(self, server) -> None:
+        """The current live-bug shape: a placeholder created via the OLD
+        create-then-rename path, left stuck at index 1 (base-index) instead
+        of moved to 0. get_or_create_session() must move it to 0 the next
+        time it's called (e.g. next daemon restart or window creation)
+        without touching any real window's index."""
+        session = server.new_session(session_name="ccbot", start_directory="/tmp")
+        session.windows[0].rename_window("__main__")
+        session.new_window(window_name="realproj")
+
+        tm = TmuxManager(session_name="ccbot")
+        tm._server = server
+        healed = tm.get_or_create_session()
+
+        placeholder = next(w for w in healed.windows if w.window_name == "__main__")
+        assert placeholder.window_index == "0"
+        real = next(w for w in healed.windows if w.window_name == "realproj")
+        assert real.window_index == "2"  # untouched — still its original slot
 
 
 @pytest.mark.integration
