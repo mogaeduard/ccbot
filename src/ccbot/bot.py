@@ -57,6 +57,8 @@ import asyncio
 import io
 import json
 import logging
+import subprocess
+import sys
 import httpx
 import re
 import shlex
@@ -630,11 +632,37 @@ def _read_account_info() -> str:
         org = oauth_account.get("organizationName")
     except (OSError, ValueError):
         pass
-    try:
-        creds = json.loads((Path.home() / ".claude" / ".credentials.json").read_text())
-        tier = (creds.get("claudeAiOauth") or {}).get("subscriptionType")
-    except (OSError, ValueError):
-        pass
+    # Tier: on macOS the Keychain is the live source — the file, if present,
+    # can be a stale leftover from token setups (seen 2026-07-05: file said
+    # "pro"/expired while the Keychain held "max"). File is Linux's source.
+    if sys.platform == "darwin":
+        try:
+            out = subprocess.run(
+                [
+                    "security",
+                    "find-generic-password",
+                    "-s",
+                    "Claude Code-credentials",
+                    "-w",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if out.returncode == 0:
+                tier = (json.loads(out.stdout).get("claudeAiOauth") or {}).get(
+                    "subscriptionType"
+                )
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass
+    if not tier:
+        try:
+            creds = json.loads(
+                (Path.home() / ".claude" / ".credentials.json").read_text()
+            )
+            tier = (creds.get("claudeAiOauth") or {}).get("subscriptionType")
+        except (OSError, ValueError):
+            pass
     if not email:
         return "❌ No Claude login found on this machine (~/.claude.json)"
     lines = [f"👤 Account: {email}"]

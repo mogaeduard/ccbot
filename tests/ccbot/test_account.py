@@ -40,7 +40,10 @@ class TestReadAccountInfo:
             oauth={"emailAddress": "a@b.com", "organizationName": "Org"},
             creds={"subscriptionType": "max"},
         )
-        with patch("ccbot.bot.Path.home", return_value=tmp_path):
+        with (
+            patch("ccbot.bot.Path.home", return_value=tmp_path),
+            patch("ccbot.bot.sys.platform", "linux"),
+        ):
             text = _read_account_info()
         assert "a@b.com" in text
         assert "Org" in text
@@ -48,19 +51,28 @@ class TestReadAccountInfo:
 
     def test_email_only_no_credentials_file(self, tmp_path) -> None:
         _write_home(tmp_path, oauth={"emailAddress": "a@b.com"})
-        with patch("ccbot.bot.Path.home", return_value=tmp_path):
+        with (
+            patch("ccbot.bot.Path.home", return_value=tmp_path),
+            patch("ccbot.bot.sys.platform", "linux"),
+        ):
             text = _read_account_info()
         assert "a@b.com" in text
         assert "Plan" not in text
 
     def test_no_login_found(self, tmp_path) -> None:
-        with patch("ccbot.bot.Path.home", return_value=tmp_path):
+        with (
+            patch("ccbot.bot.Path.home", return_value=tmp_path),
+            patch("ccbot.bot.sys.platform", "linux"),
+        ):
             text = _read_account_info()
         assert text.startswith("❌")
 
     def test_malformed_claude_json(self, tmp_path) -> None:
         (tmp_path / ".claude.json").write_text("{not json")
-        with patch("ccbot.bot.Path.home", return_value=tmp_path):
+        with (
+            patch("ccbot.bot.Path.home", return_value=tmp_path),
+            patch("ccbot.bot.sys.platform", "linux"),
+        ):
             text = _read_account_info()
         assert text.startswith("❌")
 
@@ -85,3 +97,40 @@ class TestAccountCommand:
             await account_command(update, MagicMock())
         reply.assert_awaited_once()
         assert "a@b.com" in reply.await_args.args[1]
+
+
+class TestKeychainPreference:
+    def test_darwin_prefers_keychain_over_stale_file(self, tmp_path) -> None:
+        _write_home(
+            tmp_path,
+            oauth={"emailAddress": "a@b.com"},
+            creds={"subscriptionType": "pro"},  # stale file
+        )
+        keychain = MagicMock()
+        keychain.returncode = 0
+        keychain.stdout = json.dumps({"claudeAiOauth": {"subscriptionType": "max"}})
+        with (
+            patch("ccbot.bot.Path.home", return_value=tmp_path),
+            patch("ccbot.bot.sys.platform", "darwin"),
+            patch("ccbot.bot.subprocess.run", return_value=keychain),
+        ):
+            text = _read_account_info()
+        assert "max" in text
+        assert "pro" not in text
+
+    def test_darwin_falls_back_to_file_when_keychain_fails(self, tmp_path) -> None:
+        _write_home(
+            tmp_path,
+            oauth={"emailAddress": "a@b.com"},
+            creds={"subscriptionType": "team"},
+        )
+        keychain = MagicMock()
+        keychain.returncode = 1
+        keychain.stdout = ""
+        with (
+            patch("ccbot.bot.Path.home", return_value=tmp_path),
+            patch("ccbot.bot.sys.platform", "darwin"),
+            patch("ccbot.bot.subprocess.run", return_value=keychain),
+        ):
+            text = _read_account_info()
+        assert "team" in text
