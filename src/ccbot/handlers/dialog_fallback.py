@@ -4,27 +4,25 @@ terminal_parser.is_unrecognized_dialog() flags panes that show a closed
 box-drawn border (claude --resume picker, /login, trust prompts, ...) but
 don't match any of the known UI_PATTERNS (AskUserQuestion, ExitPlanMode,
 Permission Prompt, ...). Since there's no text signature to parse, the
-fallback posts a *screenshot* of the pane instead — reusing the same
-text_to_image + send-as-document machinery as /screenshot — with a nav
-button row that forwards keystrokes into the window.
+fallback posts the pane text as a Telegram code block (text-first — see
+/screenshot for an actual picture) with a nav button row that forwards
+keystrokes into the window.
 
 The nav row reuses the existing CB_ASK_* callback data prefixes (the same
 ones interactive_ui.py's keyboard uses), so bot.py's callback_handler
 routes a press to whichever refresh applies: a known UI (text edit, via
-handle_interactive_ui) or this fallback (screenshot edit, via
+handle_interactive_ui) or this fallback (also a text edit, via
 handle_unknown_dialog) — see bot.py's _refresh_interactive_or_fallback.
 
 Key function: handle_unknown_dialog().
 """
 
-import io
 import logging
 
-from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaDocument
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 
-from ..screenshot import text_to_image
 from ..session import session_manager
-from ..terminal_parser import is_unrecognized_dialog
+from ..terminal_parser import format_pane_text_block, is_unrecognized_dialog
 from ..tmux_manager import tmux_manager
 from .callback_data import (
     CB_ASK_DOWN,
@@ -35,7 +33,7 @@ from .callback_data import (
     CB_ASK_RIGHT,
     CB_ASK_UP,
 )
-from .message_sender import cleanup_deleted_thread, is_thread_deleted_error
+from .message_sender import safe_edit, send_with_fallback
 
 logger = logging.getLogger(__name__)
 
@@ -79,8 +77,9 @@ async def handle_unknown_dialog(
     window_id: str,
     thread_id: int | None = None,
 ) -> bool:
-    """Capture the pane; if it shows an unrecognized dialog, post/refresh a
-    screenshot with nav buttons (edit in place, like interactive_ui.py).
+    """Capture the pane; if it shows an unrecognized dialog, post/refresh the
+    pane text as a code block with nav buttons (edit in place, like
+    interactive_ui.py).
 
     Returns True if a dialog was detected and (re)posted, False otherwise.
     Callers are responsible for clearing any previously-tracked message via
@@ -95,56 +94,31 @@ async def handle_unknown_dialog(
     if not pane_text or not is_unrecognized_dialog(pane_text):
         return False
 
-    ansi_text = await tmux_manager.capture_pane(w.window_id, with_ansi=True)
-    if not ansi_text:
-        return False
-    png_bytes = await text_to_image(ansi_text, with_ansi=True)
+    body = format_pane_text_block(pane_text)
     keyboard = _build_fallback_keyboard(window_id)
     chat_id = session_manager.resolve_chat_id(user_id, thread_id)
-    thread_kwargs: dict[str, int] = {}
-    if thread_id is not None:
-        thread_kwargs["message_thread_id"] = thread_id
 
     existing_msg_id = _fallback_msgs.get(ikey)
     if existing_msg_id:
-        try:
-            await bot.edit_message_media(
-                chat_id=chat_id,
-                message_id=existing_msg_id,
-                media=InputMediaDocument(
-                    media=io.BytesIO(png_bytes), filename="dialog.png"
-                ),
-                reply_markup=keyboard,
-            )
-            return True
-        except Exception as e:
-            logger.debug(
-                "Fallback screenshot edit failed for msg %s: %s, sending new",
-                existing_msg_id,
-                e,
-            )
-
-    try:
-        sent = await bot.send_document(
+        await safe_edit(
+            bot,
+            body,
             chat_id=chat_id,
-            document=io.BytesIO(png_bytes),
-            filename="dialog.png",
+            message_id=existing_msg_id,
             reply_markup=keyboard,
-            **thread_kwargs,  # type: ignore[arg-type]
         )
-    except Exception as e:
-        if thread_id is not None and is_thread_deleted_error(e):
-            await cleanup_deleted_thread(chat_id, thread_id)
-        else:
-            logger.error("Failed to send fallback dialog screenshot: %s", e)
+        return True
+
+    thread_kwargs: dict[str, int] = {}
+    if thread_id is not None:
+        thread_kwargs["message_thread_id"] = thread_id
+    sent = await send_with_fallback(
+        bot, chat_id, body, reply_markup=keyboard, **thread_kwargs
+    )
+    if sent is None:
         return False
 
     _fallback_msgs[ikey] = sent.message_id
-    if existing_msg_id:
-        try:
-            await bot.delete_message(chat_id=chat_id, message_id=existing_msg_id)
-        except Exception:
-            pass  # old message may already be gone
     return True
 
 

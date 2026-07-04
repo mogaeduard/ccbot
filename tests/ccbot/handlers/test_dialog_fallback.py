@@ -1,4 +1,4 @@
-"""Tests for dialog_fallback — screenshot fallback for unrecognized dialogs."""
+"""Tests for dialog_fallback — text code-block fallback for unrecognized dialogs."""
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -33,7 +33,7 @@ def mock_bot():
     bot = AsyncMock()
     sent_msg = MagicMock()
     sent_msg.message_id = 777
-    bot.send_document.return_value = sent_msg
+    bot.send_message.return_value = sent_msg
     return bot
 
 
@@ -49,7 +49,7 @@ def _clear_fallback_state():
 @pytest.mark.usefixtures("_clear_fallback_state")
 class TestHandleUnknownDialog:
     @pytest.mark.asyncio
-    async def test_detects_and_sends_screenshot_with_keyboard(
+    async def test_detects_and_sends_text_with_keyboard(
         self, mock_bot: AsyncMock
     ) -> None:
         window_id = "@5"
@@ -59,11 +59,6 @@ class TestHandleUnknownDialog:
         with (
             patch("ccbot.handlers.dialog_fallback.tmux_manager") as mock_tmux,
             patch("ccbot.handlers.dialog_fallback.session_manager") as mock_sm,
-            patch(
-                "ccbot.handlers.dialog_fallback.text_to_image",
-                new_callable=AsyncMock,
-                return_value=b"fake-png",
-            ),
         ):
             mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
             mock_tmux.capture_pane = AsyncMock(return_value=_UNKNOWN_DIALOG_PANE)
@@ -74,11 +69,13 @@ class TestHandleUnknownDialog:
             )
 
         assert result is True
-        mock_bot.send_document.assert_called_once()
-        call_kwargs = mock_bot.send_document.call_args.kwargs
+        mock_bot.send_message.assert_called_once()
+        call_kwargs = mock_bot.send_message.call_args.kwargs
         assert call_kwargs["chat_id"] == 100
         assert call_kwargs["message_thread_id"] == 42
         assert call_kwargs["reply_markup"] is not None
+        assert "```" in call_kwargs["text"]
+        assert "Resume Session" in call_kwargs["text"]
         assert get_fallback_msg_id(1, 42) == 777
 
     @pytest.mark.asyncio
@@ -96,13 +93,13 @@ class TestHandleUnknownDialog:
             )
 
         assert result is False
-        mock_bot.send_document.assert_not_called()
+        mock_bot.send_message.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_known_ui_defers_returns_false(self, mock_bot: AsyncMock) -> None:
         """A recognized UI (e.g. a permission prompt) must never trigger the
-        generic screenshot fallback — is_unrecognized_dialog already skips
-        it, this just confirms the handler respects that."""
+        generic text fallback — is_unrecognized_dialog already skips it,
+        this just confirms the handler respects that."""
         window_id = "@5"
         mock_window = MagicMock()
         mock_window.window_id = window_id
@@ -119,7 +116,7 @@ class TestHandleUnknownDialog:
             )
 
         assert result is False
-        mock_bot.send_document.assert_not_called()
+        mock_bot.send_message.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_window_gone_returns_false(self, mock_bot: AsyncMock) -> None:
@@ -143,11 +140,6 @@ class TestHandleUnknownDialog:
         with (
             patch("ccbot.handlers.dialog_fallback.tmux_manager") as mock_tmux,
             patch("ccbot.handlers.dialog_fallback.session_manager") as mock_sm,
-            patch(
-                "ccbot.handlers.dialog_fallback.text_to_image",
-                new_callable=AsyncMock,
-                return_value=b"fake-png",
-            ),
         ):
             mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
             mock_tmux.capture_pane = AsyncMock(return_value=_UNKNOWN_DIALOG_PANE)
@@ -163,17 +155,21 @@ class TestHandleUnknownDialog:
             )
 
         assert result is True
-        mock_bot.send_document.assert_called_once()  # only the first call sent
-        mock_bot.edit_message_media.assert_called_once()
-        edit_kwargs = mock_bot.edit_message_media.call_args.kwargs
+        mock_bot.send_message.assert_called_once()  # only the first call sent
+        mock_bot.edit_message_text.assert_called_once()
+        edit_kwargs = mock_bot.edit_message_text.call_args.kwargs
         assert edit_kwargs["message_id"] == 777
 
     @pytest.mark.asyncio
     async def test_deleted_thread_triggers_cleanup(self, mock_bot: AsyncMock) -> None:
+        """send_with_fallback (used for the initial send) centrally detects
+        "message thread not found" and hands off to cleanup_deleted_thread —
+        this just confirms handle_unknown_dialog goes through that shared
+        path instead of its own detection, and reports False (not posted)."""
         window_id = "@5"
         mock_window = MagicMock()
         mock_window.window_id = window_id
-        mock_bot.send_document = AsyncMock(
+        mock_bot.send_message = AsyncMock(
             side_effect=BadRequest("Bad Request: message thread not found")
         )
 
@@ -181,12 +177,7 @@ class TestHandleUnknownDialog:
             patch("ccbot.handlers.dialog_fallback.tmux_manager") as mock_tmux,
             patch("ccbot.handlers.dialog_fallback.session_manager") as mock_sm,
             patch(
-                "ccbot.handlers.dialog_fallback.text_to_image",
-                new_callable=AsyncMock,
-                return_value=b"fake-png",
-            ),
-            patch(
-                "ccbot.handlers.dialog_fallback.cleanup_deleted_thread",
+                "ccbot.handlers.message_sender.cleanup_deleted_thread",
                 new_callable=AsyncMock,
             ) as mock_cleanup,
         ):
@@ -213,11 +204,6 @@ class TestClearFallbackMsg:
         with (
             patch("ccbot.handlers.dialog_fallback.tmux_manager") as mock_tmux,
             patch("ccbot.handlers.dialog_fallback.session_manager") as mock_sm,
-            patch(
-                "ccbot.handlers.dialog_fallback.text_to_image",
-                new_callable=AsyncMock,
-                return_value=b"fake-png",
-            ),
         ):
             mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
             mock_tmux.capture_pane = AsyncMock(return_value=_UNKNOWN_DIALOG_PANE)

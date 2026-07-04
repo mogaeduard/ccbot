@@ -109,6 +109,7 @@ from .handlers.callback_data import (
     CB_SESSION_SELECT,
     CB_KEYS_PREFIX,
     CB_SCREENSHOT_REFRESH,
+    CB_TERM_REFRESH,
     CB_WIN_BIND,
     CB_WIN_CANCEL,
     CB_WIN_NEW,
@@ -174,7 +175,11 @@ from .handlers.status_polling import status_poll_loop
 from .screenshot import text_to_image
 from .session import session_manager
 from .session_monitor import NewMessage, SessionMonitor
-from .terminal_parser import extract_bash_output, is_interactive_ui
+from .terminal_parser import (
+    extract_bash_output,
+    format_pane_text_block,
+    is_interactive_ui,
+)
 from .tmux_manager import tmux_manager
 from .topic_titles import on_ai_title
 from .transcribe import close_client as close_transcribe_client
@@ -298,6 +303,51 @@ async def screenshot_command(
         filename="screenshot.png",
         reply_markup=keyboard,
     )
+
+
+def _build_term_keyboard(window_id: str) -> InlineKeyboardMarkup:
+    """Single refresh button for /term's text view."""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "🔄 Refresh",
+                    callback_data=f"{CB_TERM_REFRESH}{window_id}"[:64],
+                )
+            ]
+        ]
+    )
+
+
+async def term_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show the bound window's current pane text as a code block — text-first
+    terminal view (see /screenshot for an actual picture)."""
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+    if not update.message:
+        return
+
+    thread_id = _get_thread_id(update)
+    wid = session_manager.resolve_window_for_thread(user.id, thread_id)
+    if not wid:
+        await safe_reply(update.message, "❌ No session bound to this topic.")
+        return
+
+    w = await tmux_manager.find_window_by_id(wid)
+    if not w:
+        display = session_manager.get_display_name(wid)
+        await safe_reply(update.message, f"❌ Window '{display}' no longer exists.")
+        return
+
+    text = await tmux_manager.capture_pane(w.window_id)
+    if not text:
+        await safe_reply(update.message, "❌ Failed to capture pane content.")
+        return
+
+    body = format_pane_text_block(text)
+    keyboard = _build_term_keyboard(wid)
+    await safe_reply(update.message, body, reply_markup=keyboard)
 
 
 async def unbind_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2440,6 +2490,23 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             logger.error(f"Failed to refresh screenshot: {e}")
             await query.answer("Failed to refresh", show_alert=True)
 
+    # /term: Refresh
+    elif data.startswith(CB_TERM_REFRESH):
+        window_id = data[len(CB_TERM_REFRESH) :]
+        w = await tmux_manager.find_window_by_id(window_id)
+        if not w:
+            await query.answer("Window no longer exists", show_alert=True)
+            return
+
+        text = await tmux_manager.capture_pane(w.window_id)
+        if not text:
+            await query.answer("Failed to capture pane", show_alert=True)
+            return
+
+        body = format_pane_text_block(text)
+        await safe_edit(query, body, reply_markup=_build_term_keyboard(window_id))
+        await query.answer("Refreshed")
+
     elif data == "noop":
         await query.answer()
 
@@ -2747,6 +2814,7 @@ async def post_init(application: Application) -> None:
         BotCommand("speak", "Voice-note summary of the last answer"),
         BotCommand("history", "Message history for this topic"),
         BotCommand("screenshot", "Terminal screenshot with control keys"),
+        BotCommand("term", "Terminal pane text as a code block"),
         BotCommand("esc", "Send Escape to interrupt Claude"),
         BotCommand("kill", "Kill session and delete topic"),
         BotCommand("unbind", "Unbind topic from session (keeps window running)"),
@@ -2902,6 +2970,7 @@ def create_bot() -> Application:
     application.add_handler(CommandHandler("new", new_command))
     application.add_handler(CommandHandler("history", history_command))
     application.add_handler(CommandHandler("screenshot", screenshot_command))
+    application.add_handler(CommandHandler("term", term_command))
     application.add_handler(CommandHandler("esc", esc_command))
     application.add_handler(CommandHandler("unbind", unbind_command))
     application.add_handler(CommandHandler("usage", usage_command))

@@ -8,6 +8,7 @@ Constants:
   - CB_DIR_*: Directory browser navigation
   - CB_WIN_*: Window picker (bind existing unbound window)
   - CB_SCREENSHOT_*: Screenshot refresh
+  - CB_TERM_REFRESH: /term text view refresh
   - CB_ASK_*: Interactive UI navigation (arrows, enter, esc)
   - CB_KEYS_PREFIX: Screenshot control keys (kb:<key_id>:<window>)
   - CB_VOICE_*: Voice transcript confirm-first (Send/Cancel)
@@ -32,6 +33,9 @@ CB_WIN_CANCEL = "wb:cancel"
 
 # Screenshot
 CB_SCREENSHOT_REFRESH = "ss:ref:"
+
+# /term text view
+CB_TERM_REFRESH = "tm:ref:"
 
 # Interactive UI (aq: prefix kept for backward compatibility)
 CB_ASK_UP = "aq:up:"  # aq:up:<window>

@@ -14,7 +14,7 @@ a changed Claude Code version, edit UI_PATTERNS / STATUS_SPINNERS.
 
 Key functions: is_interactive_ui(), extract_interactive_content(),
 is_unrecognized_dialog(), parse_status_line(), strip_pane_chrome(),
-extract_bash_output().
+extract_bash_output(), format_pane_text_block().
 """
 
 import re
@@ -365,6 +365,22 @@ def extract_bash_output(pane_text: str, command: str) -> str | None:
         return None
 
     return "\n".join(raw_output).strip()
+
+
+PANE_TEXT_BLOCK_LIMIT = 3500  # keeps a single send well under Telegram's 4096 cap
+
+
+def format_pane_text_block(text: str, limit: int = PANE_TEXT_BLOCK_LIMIT) -> str:
+    """Format captured pane text as a fenced code block for Telegram.
+
+    Strips trailing blank lines (tmux pads a pane's height with them) and
+    caps to ``limit`` characters, keeping the BOTTOM — the most recent
+    output the user is looking at, not the part that already scrolled by.
+    """
+    body = text.rstrip()
+    if len(body) > limit:
+        body = body[-limit:]
+    return f"```\n{body}\n```"
 
 
 # ── Usage modal parsing ──────────────────────────────────────────────────────────

@@ -5,6 +5,7 @@ import pytest
 from ccbot.terminal_parser import (
     extract_bash_output,
     extract_interactive_content,
+    format_pane_text_block,
     is_interactive_ui,
     is_unrecognized_dialog,
     parse_status_line,
@@ -340,3 +341,54 @@ class TestExtractBashOutput:
         result = extract_bash_output(pane, "echo hi")
         assert result is not None
         assert not result.endswith("\n")
+
+    def test_plain_shell_fallback_matches_prompt_echo(self):
+        """FEATURE 2 verification: a window with no Claude session (no '!
+        cmd' echo) falls back to matching the shell's own prompt-echoed
+        command line — the mechanism behind plain-shell topics' echo
+        capture. Keyed purely on pane text content; extract_bash_output
+        takes no window_index, so BUG 1's placeholder renumbering (real
+        windows shifting to start at index 1 instead of 2) cannot affect it
+        — this path is window_id-only, same as capture_pane."""
+        pane = "$ echo hello\nhello\n$ "
+        result = extract_bash_output(pane, "echo hello")
+        assert result is not None
+        assert "echo hello" in result
+        assert "hello" in result
+
+
+# ── format_pane_text_block ───────────────────────────────────────────────
+
+
+class TestFormatPaneTextBlock:
+    def test_wraps_in_fenced_code_block(self):
+        result = format_pane_text_block("hello\nworld")
+        assert result == "```\nhello\nworld\n```"
+
+    def test_strips_trailing_blank_lines(self):
+        result = format_pane_text_block("hello\nworld\n\n   \n\n")
+        assert result == "```\nhello\nworld\n```"
+
+    def test_short_text_unchanged(self):
+        text = "line1\nline2\nline3"
+        result = format_pane_text_block(text, limit=3500)
+        assert result == f"```\n{text}\n```"
+
+    def test_caps_length_keeping_bottom(self):
+        # 100 numbered lines; only the tail should survive a small limit.
+        lines = [f"line {i}" for i in range(100)]
+        text = "\n".join(lines)
+
+        result = format_pane_text_block(text, limit=50)
+
+        assert "line 99" in result  # most recent output kept
+        assert "line 0\n" not in result  # earliest output cut
+        # fence + capped body: bounded well above the raw limit, nowhere
+        # near the uncapped ~700-char full text.
+        assert len(result) < 100
+
+    def test_default_limit_is_3500(self):
+        text = "x" * 10_000
+        result = format_pane_text_block(text)
+        # 3500 chars of body + the two fence lines ("```\n" and "\n```")
+        assert len(result) == 3500 + len("```\n") + len("\n```")
