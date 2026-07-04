@@ -55,6 +55,7 @@ Key functions: create_bot(), handle_new_message().
 
 import asyncio
 import io
+import json
 import logging
 import httpx
 import re
@@ -613,6 +614,46 @@ async def unmute_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         (ccbot_dir() / "mute-phone").unlink(missing_ok=True)
 
     await safe_reply(update.message, _mute_status_text())
+
+
+def _read_account_info() -> str:
+    """Which Claude account this HOST is logged into (file-based default).
+    Email/org from ~/.claude.json; plan tier from ~/.claude/.credentials.json
+    (Linux only — macOS keeps credentials in the Keychain, so tier is omitted
+    there). Sessions launched with a CLAUDE_CODE_OAUTH_TOKEN env override may
+    run as a different account; this reports what plain `claude` uses."""
+    email = org = tier = None
+    try:
+        data = json.loads((Path.home() / ".claude.json").read_text())
+        oauth_account = data.get("oauthAccount") or {}
+        email = oauth_account.get("emailAddress")
+        org = oauth_account.get("organizationName")
+    except (OSError, ValueError):
+        pass
+    try:
+        creds = json.loads((Path.home() / ".claude" / ".credentials.json").read_text())
+        tier = (creds.get("claudeAiOauth") or {}).get("subscriptionType")
+    except (OSError, ValueError):
+        pass
+    if not email:
+        return "❌ No Claude login found on this machine (~/.claude.json)"
+    lines = [f"👤 Account: {email}"]
+    if org:
+        lines.append(f"🏢 Org: {org}")
+    if tier:
+        lines.append(f"📦 Plan: {tier}")
+    lines.append("(host default — env-token sessions may differ)")
+    return "\n".join(lines)
+
+
+async def account_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/account: show which Claude account this host's sessions run on."""
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+    if not update.message:
+        return
+    await safe_reply(update.message, _read_account_info())
 
 
 # /killall confirmation TTL and pending state (see callback_handler's
@@ -2896,6 +2937,7 @@ async def post_init(application: Application) -> None:
         BotCommand("unlock", "Release the lock"),
         BotCommand("killall", "Panic button: kill every session"),
         BotCommand("usage", "Show Claude Code usage remaining"),
+        BotCommand("account", "Which Claude account this host runs on"),
     ]
     # Add Claude Code slash commands
     for cmd_name, desc in CC_COMMANDS.items():
@@ -3049,6 +3091,7 @@ def create_bot() -> Application:
     application.add_handler(CommandHandler("unlock", unlock_command))
     application.add_handler(CommandHandler("sleep", sleep_command))
     application.add_handler(CommandHandler("wake", wake_command))
+    application.add_handler(CommandHandler("account", account_command))
     application.add_handler(CommandHandler("mute", mute_command))
     application.add_handler(CommandHandler("unmute", unmute_command))
     application.add_handler(CommandHandler("killall", killall_command))
