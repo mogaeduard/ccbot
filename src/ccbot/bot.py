@@ -97,6 +97,7 @@ from .handlers.callback_data import (
     CB_ASK_REFRESH,
     CB_ASK_RIGHT,
     CB_ASK_SPACE,
+    CB_ASK_SUBMIT,
     CB_ASK_TAB,
     CB_ASK_UP,
     CB_DIR_CANCEL,
@@ -153,9 +154,12 @@ from .handlers.interactive_ui import (
     clear_interactive_msg,
     get_interactive_msg_id,
     get_interactive_option_label,
+    get_interactive_option_state,
     get_interactive_window,
     handle_interactive_ui,
+    pop_pending_inline_edit,
     set_interactive_mode,
+    set_pending_inline_edit,
 )
 from .handlers.message_queue import (
     clear_status_msg_info,
@@ -187,6 +191,7 @@ from .terminal_parser import (
     extract_bash_output,
     format_pane_text_block,
     is_interactive_ui,
+    parse_focused_option,
 )
 from .tmux_manager import tmux_manager
 from .topic_titles import on_ai_title
@@ -195,6 +200,10 @@ from .transcribe import transcribe_voice
 from .utils import ccbot_dir
 
 logger = logging.getLogger(__name__)
+
+# multiSelect options screen: the unnumbered, focused "Submit" pseudo-row
+# below the last option — Enter there opens the review screen.
+_RE_SUBMIT_ROW = re.compile(r"^\s*❯\s+Submit\s*$", re.MULTILINE)
 
 # Session monitor instance
 session_monitor: SessionMonitor | None = None
@@ -2032,6 +2041,21 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     except Exception as e:
         logger.warning("interactive-UI precheck failed, continuing to injection: %s", e)
 
+    # A focused multiSelect free-text row was armed by CB_ASK_NUM
+    # (callback_handler) — type this message straight into that row
+    # instead of Claude's prompt. No Enter: Claude Code auto-checks the
+    # box on the first keystroke and a trailing Enter toggles it back off.
+    if (
+        pop_pending_inline_edit(user.id, thread_id)
+        and get_interactive_window(user.id, thread_id) == wid
+    ):
+        # Single-line field — a raw \n is an Enter keystroke and would
+        # toggle the checkbox off mid-edit.
+        await tmux_manager.send_keys(w.window_id, text.replace("\n", " "), enter=False)
+        await asyncio.sleep(0.5)
+        await handle_interactive_ui(context.bot, user.id, wid, thread_id)
+        return
+
     success, message = await session_manager.send_to_window(wid, text)
     if not success:
         await safe_reply(update.message, f"❌ {message}")
@@ -2808,23 +2832,69 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await safe_edit(query, "Cancelled")
         await query.answer("Cancelled")
 
-    # Interactive UI: press an option number directly. Digits both select
-    # and confirm in Claude Code choice dialogs (verified live 2026-07-05).
-    # Free-text options ("Type something.", "Chat about this") only focus
-    # the dialog's input — tell the user their next message fills it.
+    # Interactive UI: press an option number directly. In single-select
+    # Claude Code choice dialogs, digits both select and confirm (verified
+    # live 2026-07-05). In multiSelect dialogs, digits only TOGGLE that
+    # option's checkbox (verified live 2026-07-05) — confirming requires
+    # the ✅ Submit button (CB_ASK_SUBMIT) or navigating there manually.
+    # Single-select free-text options ("Type something.", "Chat about
+    # this") are a popup: a digit+Enter opens it, then the next message
+    # fills it. multiSelect's free-text row is different — it's an
+    # inline-editable option (a digit press just toggles an empty checked
+    # "Type something" entry, which is useless) — see the elif below.
     elif data.startswith(CB_ASK_NUM):
         rest = data[len(CB_ASK_NUM) :]
         digit, _, window_id = rest.partition(":")
         thread_id = _get_thread_id(update)
-        label = get_interactive_option_label(
-            user.id, thread_id, int(digit) if digit.isdigit() else -1
+        num = int(digit) if digit.isdigit() else -1
+        label = get_interactive_option_label(user.id, thread_id, num)
+        old_state = get_interactive_option_state(user.id, thread_id, num)
+        is_text_option = bool(label) and label.lower().rstrip(".…").strip() in (
+            "type something",
+            "chat about this",
         )
         w = await tmux_manager.find_window_by_id(window_id)
-        if w and digit.isdigit():
-            is_text_option = bool(label) and label.lower().rstrip(".…").strip() in (
-                "type something",
-                "chat about this",
+        if not (w and digit.isdigit()):
+            await query.answer("Window no longer exists", show_alert=True)
+        elif old_state is not None and is_text_option:
+            # multiSelect free-text row: focus it with arrow keys instead
+            # of pressing its digit, then arm inline-edit mode so the
+            # user's next message types straight into the row.
+            pane_text = await tmux_manager.capture_pane(w.window_id)
+            focused = parse_focused_option(pane_text) if pane_text else None
+            delta = num - focused if focused is not None else 0
+            step_key = "Down" if delta > 0 else "Up"
+            for _ in range(abs(delta)):
+                await tmux_manager.send_keys(
+                    w.window_id, step_key, enter=False, literal=False
+                )
+                await asyncio.sleep(0.15)
+            await asyncio.sleep(0.2)
+            pane_text = await tmux_manager.capture_pane(w.window_id)
+            if (parse_focused_option(pane_text) if pane_text else None) != num:
+                await query.answer(
+                    "Couldn't focus the option — use ↑/↓", show_alert=True
+                )
+            else:
+                set_pending_inline_edit(user.id, thread_id)
+                await _refresh_interactive_or_fallback(
+                    context.bot, user.id, window_id, thread_id
+                )
+                await query.answer(
+                    f"✏️ {digit} — send your text as a normal message",
+                    show_alert=True,
+                )
+        elif old_state is not None:
+            # multiSelect: the digit just toggles the checkbox — report
+            # the new (post-toggle) state, not the stale pre-press one.
+            await tmux_manager.send_keys(w.window_id, digit, enter=False)
+            await asyncio.sleep(0.6)
+            await _refresh_interactive_or_fallback(
+                context.bot, user.id, window_id, thread_id
             )
+            mark = "☐" if old_state else "☑"
+            await query.answer(f"{mark} {digit}. {label or ''}"[:200])
+        else:
             await tmux_manager.send_keys(w.window_id, digit, enter=False)
             if is_text_option:
                 # Digits only SELECT free-text options (regular options
@@ -2845,6 +2915,52 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 )
             else:
                 await query.answer(f"▶ {digit}. {label or ''}"[:200])
+
+    # Interactive UI: multiSelect Submit — arrow-tab to the dialog's Submit
+    # screen and confirm. The dialog has a fixed tab order ending in
+    # "✔ Submit", so pressing → up to 5 times always reaches it; landing on
+    # the review screen (numbered "1. Submit answers") is already handled
+    # by CB_ASK_NUM's normal digit-select-and-confirm path.
+    elif data.startswith(CB_ASK_SUBMIT):
+        window_id = data[len(CB_ASK_SUBMIT) :]
+        thread_id = _get_thread_id(update)
+        w = await tmux_manager.find_window_by_id(window_id)
+        if w:
+            # Route to the review screen from any focus position (verified
+            # live 2026-07-05): from a regular option row → presses tab-
+            # switch to Submit. From the inline-editable free-text row,
+            # Right only moves the text cursor — walk Down instead, onto
+            # the unnumbered "❯ Submit" pseudo-row, where Enter opens the
+            # review screen ("ctrl+g to edit" in the footer marks that
+            # editable-row focus state).
+            submitted = False
+            for _ in range(6):
+                pane_text = await tmux_manager.capture_pane(w.window_id) or ""
+                if "Ready to submit" in pane_text:
+                    await tmux_manager.send_keys(w.window_id, "1", enter=False)
+                    submitted = True
+                    break
+                if _RE_SUBMIT_ROW.search(pane_text):
+                    key = "Enter"
+                elif "ctrl+g to edit" in pane_text:
+                    key = "Down"
+                else:
+                    key = "Right"
+                await tmux_manager.send_keys(
+                    w.window_id, key, enter=False, literal=False
+                )
+                await asyncio.sleep(0.5)
+            if submitted:
+                await asyncio.sleep(0.6)
+                await _refresh_interactive_or_fallback(
+                    context.bot, user.id, window_id, thread_id
+                )
+                await query.answer("✅ Submitted")
+            else:
+                await _refresh_interactive_or_fallback(
+                    context.bot, user.id, window_id, thread_id
+                )
+                await query.answer("Couldn't reach Submit tab — use the arrows")
         else:
             await query.answer("Window no longer exists", show_alert=True)
 

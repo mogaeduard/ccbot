@@ -8,6 +8,9 @@ from ccbot.terminal_parser import (
     format_pane_text_block,
     is_interactive_ui,
     is_unrecognized_dialog,
+    parse_focused_option,
+    parse_numbered_options,
+    parse_option_states,
     parse_status_line,
     strip_pane_chrome,
 )
@@ -97,6 +100,12 @@ class TestExtractInteractiveContent:
         assert result.name == "AskUserQuestion"
         assert "Enter to select" in result.content
 
+    def test_ask_user_multiselect(self, sample_pane_ask_user_multiselect: str):
+        result = extract_interactive_content(sample_pane_ask_user_multiselect)
+        assert result is not None
+        assert result.name == "AskUserQuestion"
+        assert "[✔] Cherry" in result.content
+
     def test_permission_prompt(self, sample_pane_permission: str):
         result = extract_interactive_content(sample_pane_permission)
         assert result is not None
@@ -174,6 +183,87 @@ class TestExtractInteractiveContent:
     def test_min_gap_too_small_returns_none(self):
         pane = "  Do you want to proceed?\n  Esc to cancel\n"
         assert extract_interactive_content(pane) is None
+
+
+# ── parse_numbered_options / parse_option_states / parse_focused_option ──
+
+
+class TestParseNumberedOptions:
+    def test_single_select_labels_unchanged(self, sample_pane_settings: str):
+        """A single-select dialog has no checkboxes to strip — labels come
+        out exactly as printed."""
+        content = extract_interactive_content(sample_pane_settings)
+        assert content is not None
+        options = parse_numbered_options(content.content)
+        assert (2, "Sonnet                 Sonnet 4.6 · Best for everyday tasks") in (
+            options
+        )
+
+    def test_multiselect_strips_checkboxes(self, sample_pane_ask_user_multiselect: str):
+        options = parse_numbered_options(sample_pane_ask_user_multiselect)
+        assert options == [
+            (1, "Apple"),
+            (2, "Banana"),
+            (3, "Cherry"),
+            (4, "Type something"),
+            (5, "Chat about this"),
+        ]
+
+    @pytest.mark.parametrize(
+        ("box", "checked"),
+        [
+            ("[ ]", False),
+            ("[]", False),
+            ("[x]", True),
+            ("[X]", True),
+            ("[✔]", True),
+            ("[✓]", True),
+            ("[☑]", True),
+        ],
+    )
+    def test_checkbox_variants(self, box: str, checked: bool):
+        content = f"1. {box} Mango\n"
+        assert parse_numbered_options(content) == [(1, "Mango")]
+        assert parse_option_states(content) == {1: checked}
+
+    def test_focused_checked_row(self):
+        """`❯ 4. [✔] Mango` parses as number=4, label='Mango', state=True."""
+        content = "❯ 4. [✔] Mango\n"
+        assert parse_numbered_options(content) == [(4, "Mango")]
+        assert parse_option_states(content) == {4: True}
+        assert parse_focused_option(content) == 4
+
+
+class TestParseOptionStates:
+    def test_mixed_checked_and_unchecked(self, sample_pane_ask_user_multiselect: str):
+        states = parse_option_states(sample_pane_ask_user_multiselect)
+        assert states == {1: False, 2: False, 3: True, 4: False}
+        # "5. Chat about this" carries no checkbox — a plain fallback option.
+        assert 5 not in states
+
+    def test_single_select_has_no_states(self, sample_pane_ask_user_single_tab: str):
+        content = extract_interactive_content(sample_pane_ask_user_single_tab)
+        assert content is not None
+        assert parse_option_states(content.content) == {}
+
+    def test_submit_review_screen_has_no_states(
+        self, sample_pane_ask_user_multiselect_submit: str
+    ):
+        """The Submit tab re-lists options as plain 'N. label' — no
+        checkboxes, so states must come back empty even though this is a
+        multiSelect dialog."""
+        assert parse_option_states(sample_pane_ask_user_multiselect_submit) == {}
+
+
+class TestParseFocusedOption:
+    def test_returns_focused_row_number(self, sample_pane_ask_user_multiselect: str):
+        assert parse_focused_option(sample_pane_ask_user_multiselect) == 1
+
+    def test_none_when_no_focus_marker(self):
+        assert parse_focused_option("1. Apple\n2. Banana\n") is None
+
+    def test_none_for_empty_content(self):
+        assert parse_focused_option("") is None
 
 
 # ── is_interactive_ui ────────────────────────────────────────────────────

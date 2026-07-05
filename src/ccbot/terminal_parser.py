@@ -215,17 +215,23 @@ def is_interactive_ui(pane_text: str) -> bool:
 # they never start with "<digit>."
 _RE_NUMBERED_OPTION = re.compile(r"^\s*(?:❯\s*)?(\d{1,2})\.\s+(\S.*)$")
 
+# multiSelect checkbox glued onto an option label: "[ ] Apple", "[✔] Cherry".
+# The character class covers every checked glyph Claude Code renders plus a
+# blank (unchecked); tolerant of stray spacing on either side of the glyph.
+# A bracket holding anything else (e.g. an ordinary "[Beta] Feature" label)
+# won't match, so plain single-select labels pass through untouched.
+_RE_CHECKBOX = re.compile(r"^\[\s*([ xX✔✓☑]?)\s*\]\s*(.*)$")
+_CHECKED_GLYPHS = frozenset({"x", "X", "✔", "✓", "☑"})
 
-def parse_numbered_options(content: str) -> list[tuple[int, str]]:
-    """Extract numbered options from interactive-UI content.
 
-    Claude Code's choice dialogs (AskUserQuestion, permission prompts,
-    ExitPlanMode) list options as "N. label" lines, and pressing the digit
-    key selects that option directly. Returns (number, first-line label)
-    pairs in on-screen order; wrapped label continuations and description
-    lines are ignored. Duplicate numbers (shouldn't happen) keep the first.
+def _parse_option_lines(content: str) -> list[tuple[int, str, bool | None]]:
+    """Numbered option lines as (number, clean label, checked-or-None).
+
+    Shared scan behind parse_numbered_options() and parse_option_states().
+    ``checked`` is None when the line has no checkbox (single-select),
+    else True/False for a checked/unchecked multiSelect box.
     """
-    options: list[tuple[int, str]] = []
+    results: list[tuple[int, str, bool | None]] = []
     seen: set[int] = set()
     for line in content.split("\n"):
         m = _RE_NUMBERED_OPTION.match(line)
@@ -235,8 +241,60 @@ def parse_numbered_options(content: str) -> list[tuple[int, str]]:
         if num in seen:
             continue
         seen.add(num)
-        options.append((num, m.group(2).strip()))
-    return options
+        raw_label = m.group(2).strip()
+        box = _RE_CHECKBOX.match(raw_label)
+        if box:
+            results.append((num, box.group(2).strip(), box.group(1) in _CHECKED_GLYPHS))
+        else:
+            results.append((num, raw_label, None))
+    return results
+
+
+def parse_numbered_options(content: str) -> list[tuple[int, str]]:
+    """Extract numbered options from interactive-UI content.
+
+    Claude Code's choice dialogs (AskUserQuestion, permission prompts,
+    ExitPlanMode) list options as "N. label" lines, and pressing the digit
+    key selects that option directly. Returns (number, first-line label)
+    pairs in on-screen order; wrapped label continuations and description
+    lines are ignored. Duplicate numbers (shouldn't happen) keep the first.
+    multiSelect checkboxes ("[ ] Apple") are stripped from the label.
+    """
+    return [(num, label) for num, label, _checked in _parse_option_lines(content)]
+
+
+def parse_option_states(content: str) -> dict[int, bool]:
+    """Extract multiSelect checkbox states from interactive-UI content.
+
+    Returns {option_number: checked} for every numbered option that carries
+    a checkbox. An empty dict means the screen has no checkboxes at all —
+    a single-select dialog, or the multiSelect "review your answers" /
+    Submit tab, which re-lists options as plain "N. label" lines.
+    """
+    return {
+        num: checked
+        for num, _label, checked in _parse_option_lines(content)
+        if checked is not None
+    }
+
+
+# The ❯ cursor marks the focused numbered line — unlike _RE_NUMBERED_OPTION
+# (which treats ❯ as optional filler), this only matches when it's present.
+_RE_FOCUSED_OPTION = re.compile(r"^\s*❯\s*(\d{1,2})\.\s+\S")
+
+
+def parse_focused_option(content: str) -> int | None:
+    """Number of the ❯-focused option line, or None if nothing is focused.
+
+    Used to steer keyboard focus onto a specific option (e.g. multiSelect's
+    inline-editable "Type something" row) by computing how many Up/Down
+    presses separate the current focus from the target.
+    """
+    for line in content.split("\n"):
+        m = _RE_FOCUSED_OPTION.match(line)
+        if m:
+            return int(m.group(1))
+    return None
 
 
 # ── Unrecognized dialog fallback ─────────────────────────────────────────

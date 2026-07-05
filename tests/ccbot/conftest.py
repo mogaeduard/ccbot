@@ -124,6 +124,50 @@ def sample_pane_ask_user_single_tab():
 
 
 @pytest.fixture
+def sample_pane_ask_user_multiselect():
+    """multiSelect AskUserQuestion — options carry checkboxes, one is
+    focused, and a free-text "Type something" row closes the list.
+    Captured live from Claude Code v2.1.201 (2026-07-05)."""
+    return (
+        "←  ☐ Fruits  ✔ Submit  →\n"
+        "\n"
+        "Which fruits do you like?\n"
+        "\n"
+        "❯ 1. [ ] Apple\n"
+        "  Crisp and classic\n"
+        "  2. [ ] Banana\n"
+        "  Sweet and soft\n"
+        "  3. [✔] Cherry\n"
+        "  Small and tart\n"
+        "  4. [ ] Type something\n"
+        "     Submit\n"
+        "─────\n"
+        "  5. Chat about this\n"
+        "\n"
+        "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+    )
+
+
+@pytest.fixture
+def sample_pane_ask_user_multiselect_submit():
+    """multiSelect Submit tab — the review screen, plain numbered options
+    with no checkboxes (parse_option_states must return {})."""
+    return (
+        "←  ☒ Fruits  ✔ Submit  →\n"
+        "\n"
+        "Review your answers\n"
+        "\n"
+        " ● Which fruits do you like?\n"
+        "   → Banana, Dates\n"
+        "\n"
+        "Ready to submit your answers?\n"
+        "\n"
+        "❯ 1. Submit answers\n"
+        "  2. Cancel\n"
+    )
+
+
+@pytest.fixture
 def sample_pane_permission():
     return "  Do you want to proceed?\n  Some permission details\n  Esc to cancel\n"
 

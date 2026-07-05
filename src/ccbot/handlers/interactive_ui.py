@@ -24,6 +24,7 @@ from ..terminal_parser import (
     extract_interactive_content,
     is_interactive_ui,
     parse_numbered_options,
+    parse_option_states,
 )
 from ..tmux_manager import tmux_manager
 from .callback_data import (
@@ -35,6 +36,7 @@ from .callback_data import (
     CB_ASK_REFRESH,
     CB_ASK_RIGHT,
     CB_ASK_SPACE,
+    CB_ASK_SUBMIT,
     CB_ASK_TAB,
     CB_ASK_UP,
 )
@@ -59,6 +61,11 @@ _interactive_mode: dict[tuple[int, int], str] = {}
 # handle_interactive_ui every tick (self-healing refresh) without
 # hammering Telegram with no-op edit_message_text calls.
 _interactive_content: dict[tuple[int, int], str] = {}
+
+# Armed when a multiSelect free-text row ("Type something") has been
+# focused via arrow keys and is waiting for the user's next plain message —
+# that message gets typed straight into the row instead of Claude's prompt.
+_pending_inline_edit: set[tuple[int, int]] = set()
 
 # Option labels that focus a free-text input instead of answering directly.
 # Pressing their digit focuses the input; the user's next plain Telegram
@@ -85,6 +92,35 @@ def get_interactive_option_label(
         if num == number:
             return label
     return None
+
+
+def get_interactive_option_state(
+    user_id: int, thread_id: int | None, number: int
+) -> bool | None:
+    """Checkbox state of option `number` in the currently posted UI.
+
+    None means either no UI is cached or the option has no checkbox (a
+    single-select dialog) — the caller's cue that this isn't multiSelect.
+    """
+    content = _interactive_content.get((user_id, thread_id or 0))
+    if not content:
+        return None
+    return parse_option_states(content).get(number)
+
+
+def set_pending_inline_edit(user_id: int, thread_id: int | None = None) -> None:
+    """Arm inline-edit mode: the user's next plain message types into a
+    focused multiSelect free-text row instead of going to Claude's prompt."""
+    _pending_inline_edit.add((user_id, thread_id or 0))
+
+
+def pop_pending_inline_edit(user_id: int, thread_id: int | None = None) -> bool:
+    """Consume the pending inline-edit flag. True if it had been set."""
+    try:
+        _pending_inline_edit.remove((user_id, thread_id or 0))
+        return True
+    except KeyError:
+        return False
 
 
 def get_interactive_window(user_id: int, thread_id: int | None = None) -> str | None:
@@ -122,6 +158,7 @@ def _build_interactive_keyboard(
     window_id: str,
     ui_name: str = "",
     options: list[tuple[int, str]] | None = None,
+    states: dict[int, bool] | None = None,
 ) -> InlineKeyboardMarkup:
     """Build keyboard for interactive UI navigation.
 
@@ -131,6 +168,12 @@ def _build_interactive_keyboard(
     ("Type something.", "Chat about this") get a ✏️ marker: their digit
     focuses the dialog's text input, and the user's next plain message is
     typed into it.
+
+    ``states`` carries multiSelect checkbox state (``parse_option_states``):
+    when an option number is present, its button is prefixed ``☑ `` or
+    ``☐ `` (checked/unchecked — digits there only toggle, they don't
+    confirm), and a full-width ✅ Submit row is inserted before the nav row
+    so the user can jump straight to the dialog's Submit tab and confirm.
 
     A compact navigation row is kept below for multi-tab dialogs and
     anything the digit shortcut can't reach. ``ui_name`` controls layout:
@@ -148,12 +191,23 @@ def _build_interactive_keyboard(
             display = f"✏️ {num}. {label}"
         else:
             display = f"{num}. {label}"
+        if states and num in states:
+            display = f"{'☑' if states[num] else '☐'} {display}"
         if len(display) > _OPTION_LABEL_LIMIT:
             display = display[: _OPTION_LABEL_LIMIT - 1].rstrip() + "…"
         rows.append(
             [
                 InlineKeyboardButton(
                     display, callback_data=f"{CB_ASK_NUM}{num}:{window_id}"[:64]
+                )
+            ]
+        )
+
+    if states:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "✅ Submit", callback_data=f"{CB_ASK_SUBMIT}{window_id}"[:64]
                 )
             ]
         )
@@ -243,8 +297,9 @@ async def handle_interactive_ui(
 
     # Build message with per-option buttons + navigation keyboard
     options = parse_numbered_options(content.content)
+    states = parse_option_states(content.content)
     keyboard = _build_interactive_keyboard(
-        window_id, ui_name=content.name, options=options
+        window_id, ui_name=content.name, options=options, states=states
     )
 
     # Send as plain text (no markdown conversion)
@@ -330,6 +385,7 @@ async def clear_interactive_msg(
     msg_id = _interactive_msgs.pop(ikey, None)
     _interactive_mode.pop(ikey, None)
     _interactive_content.pop(ikey, None)
+    _pending_inline_edit.discard(ikey)
     logger.debug(
         "Clear interactive msg: user=%d, thread=%s, msg_id=%s",
         user_id,
