@@ -692,7 +692,11 @@ class SessionManager:
             else:
                 return None
 
-        # Single pass: read file once, extract summary + count messages
+        # Single pass: read file once, extract title + count messages.
+        # Title preference: ai-title (Claude Code's own AI-generated session
+        # title, short and meaningful — same source topic_titles.py renames
+        # topics from) > summary entry > last user message fallback.
+        ai_title = ""
         summary = ""
         last_user_msg = ""
         message_count = 0
@@ -705,8 +709,13 @@ class SessionManager:
                     message_count += 1
                     try:
                         data = json.loads(line)
+                        # AI-generated title (latest one wins)
+                        if data.get("type") == "ai-title":
+                            t = data.get("aiTitle", "")
+                            if t:
+                                ai_title = t
                         # Check for summary
-                        if data.get("type") == "summary":
+                        elif data.get("type") == "summary":
                             s = data.get("summary", "")
                             if s:
                                 summary = s
@@ -720,6 +729,7 @@ class SessionManager:
         except OSError:
             return None
 
+        summary = ai_title or summary
         if not summary:
             summary = last_user_msg[:50] if last_user_msg else "Untitled"
 
@@ -732,14 +742,17 @@ class SessionManager:
 
     # --- Directory session listing ---
 
-    async def list_sessions_for_directory(self, cwd: str) -> list[ClaudeSession]:
+    async def list_sessions_for_directory(
+        self, cwd: str, limit: int | None = 10
+    ) -> list[ClaudeSession]:
         """List existing Claude sessions for a directory.
 
         Encodes the cwd path to find the project directory under
         ~/.claude/projects/{encoded_cwd}/, globs *.jsonl files, and
         extracts summary info from each.
 
-        Returns a list sorted by mtime (most recent first), capped at 10.
+        Returns a list sorted by mtime (most recent first), capped at
+        ``limit`` (None = no cap, used by the picker's "All" view).
         """
         encoded_cwd = self._encode_cwd(cwd)
         project_dir = config.claude_projects_path / encoded_cwd
@@ -753,18 +766,28 @@ class SessionManager:
             reverse=True,
         )
 
-        # Skip sessions-index and cap at 10
+        # Skip sessions-index and cap at limit
         sessions: list[ClaudeSession] = []
         for f in jsonl_files:
             if f.stem == "sessions-index":
                 continue
-            if len(sessions) >= 10:
+            if limit is not None and len(sessions) >= limit:
                 break
             session_id = f.stem
             session = await self._get_session_direct(session_id, cwd)
             if session and session.message_count > 0:
                 sessions.append(session)
         return sessions
+
+    def count_session_files_for_directory(self, cwd: str) -> int:
+        """Fast upper-bound count of session files for a directory (no
+        content reads — empty sessions are excluded only by the full
+        listing, so this may slightly over-count)."""
+        encoded_cwd = self._encode_cwd(cwd)
+        project_dir = config.claude_projects_path / encoded_cwd
+        if not project_dir.is_dir():
+            return 0
+        return sum(1 for f in project_dir.glob("*.jsonl") if f.stem != "sessions-index")
 
     # --- Window → Session resolution ---
 

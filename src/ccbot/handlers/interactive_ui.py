@@ -20,13 +20,18 @@ from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest
 
 from ..session import session_manager
-from ..terminal_parser import extract_interactive_content, is_interactive_ui
+from ..terminal_parser import (
+    extract_interactive_content,
+    is_interactive_ui,
+    parse_numbered_options,
+)
 from ..tmux_manager import tmux_manager
 from .callback_data import (
     CB_ASK_DOWN,
     CB_ASK_ENTER,
     CB_ASK_ESC,
     CB_ASK_LEFT,
+    CB_ASK_NUM,
     CB_ASK_REFRESH,
     CB_ASK_RIGHT,
     CB_ASK_SPACE,
@@ -49,6 +54,37 @@ _interactive_msgs: dict[tuple[int, int], int] = {}
 
 # Track interactive mode: (user_id, thread_id_or_0) -> window_id
 _interactive_mode: dict[tuple[int, int], str] = {}
+
+# Last posted UI content per key — lets the status poller re-run
+# handle_interactive_ui every tick (self-healing refresh) without
+# hammering Telegram with no-op edit_message_text calls.
+_interactive_content: dict[tuple[int, int], str] = {}
+
+# Option labels that focus a free-text input instead of answering directly.
+# Pressing their digit focuses the input; the user's next plain Telegram
+# message is then typed into it (message_handler injects text as keystrokes).
+_TEXT_INPUT_LABELS = ("type something", "chat about this")
+
+# Button label budget — Telegram clips visually around 25-35 chars on
+# phones; keep the number prefix and the label head visible.
+_OPTION_LABEL_LIMIT = 36
+
+
+def _is_text_input_option(label: str) -> bool:
+    return label.lower().rstrip(".…").strip() in _TEXT_INPUT_LABELS
+
+
+def get_interactive_option_label(
+    user_id: int, thread_id: int | None, number: int
+) -> str | None:
+    """Label of option `number` in the currently posted UI, if known."""
+    content = _interactive_content.get((user_id, thread_id or 0))
+    if not content:
+        return None
+    for num, label in parse_numbered_options(content):
+        if num == number:
+            return label
+    return None
 
 
 def get_interactive_window(user_id: int, thread_id: int | None = None) -> str | None:
@@ -85,50 +121,65 @@ def get_interactive_msg_id(user_id: int, thread_id: int | None = None) -> int | 
 def _build_interactive_keyboard(
     window_id: str,
     ui_name: str = "",
+    options: list[tuple[int, str]] | None = None,
 ) -> InlineKeyboardMarkup:
     """Build keyboard for interactive UI navigation.
 
-    ``ui_name`` controls the layout: ``RestoreCheckpoint`` omits ←/→ keys
-    since only vertical selection is needed.
+    When ``options`` is non-empty, one button per numbered option is placed
+    first (full-width rows, so labels stay readable) — tapping one sends
+    that digit to the dialog, which selects it directly. Free-text options
+    ("Type something.", "Chat about this") get a ✏️ marker: their digit
+    focuses the dialog's text input, and the user's next plain message is
+    typed into it.
+
+    A compact navigation row is kept below for multi-tab dialogs and
+    anything the digit shortcut can't reach. ``ui_name`` controls layout:
+    ``RestoreCheckpoint`` omits ←/→ keys since only vertical selection is
+    needed.
     """
     vertical_only = ui_name == "RestoreCheckpoint"
 
     rows: list[list[InlineKeyboardButton]] = []
-    # Row 1: directional keys
-    rows.append(
-        [
-            InlineKeyboardButton(
-                "␣ Space", callback_data=f"{CB_ASK_SPACE}{window_id}"[:64]
-            ),
-            InlineKeyboardButton("↑", callback_data=f"{CB_ASK_UP}{window_id}"[:64]),
-            InlineKeyboardButton(
-                "⇥ Tab", callback_data=f"{CB_ASK_TAB}{window_id}"[:64]
-            ),
-        ]
-    )
-    if vertical_only:
+
+    for num, label in options or []:
+        if num > 9:
+            continue  # send_keys sends one digit keypress; >9 never occurs in practice
+        if _is_text_input_option(label):
+            display = f"✏️ {num}. {label}"
+        else:
+            display = f"{num}. {label}"
+        if len(display) > _OPTION_LABEL_LIMIT:
+            display = display[: _OPTION_LABEL_LIMIT - 1].rstrip() + "…"
         rows.append(
             [
                 InlineKeyboardButton(
-                    "↓", callback_data=f"{CB_ASK_DOWN}{window_id}"[:64]
-                ),
+                    display, callback_data=f"{CB_ASK_NUM}{num}:{window_id}"[:64]
+                )
             ]
         )
-    else:
-        rows.append(
+
+    # Navigation row: kept even with option buttons — multi-select dialogs
+    # need Space/arrows, multi-question dialogs need Tab/←/→.
+    nav: list[InlineKeyboardButton] = [
+        InlineKeyboardButton("␣", callback_data=f"{CB_ASK_SPACE}{window_id}"[:64]),
+        InlineKeyboardButton("↑", callback_data=f"{CB_ASK_UP}{window_id}"[:64]),
+        InlineKeyboardButton("↓", callback_data=f"{CB_ASK_DOWN}{window_id}"[:64]),
+    ]
+    if not vertical_only:
+        nav.extend(
             [
                 InlineKeyboardButton(
                     "←", callback_data=f"{CB_ASK_LEFT}{window_id}"[:64]
-                ),
-                InlineKeyboardButton(
-                    "↓", callback_data=f"{CB_ASK_DOWN}{window_id}"[:64]
                 ),
                 InlineKeyboardButton(
                     "→", callback_data=f"{CB_ASK_RIGHT}{window_id}"[:64]
                 ),
             ]
         )
-    # Row 2: action keys
+    nav.append(InlineKeyboardButton("⇥", callback_data=f"{CB_ASK_TAB}{window_id}"[:64]))
+    rows.append(nav)
+
+    # Action row
     rows.append(
         [
             InlineKeyboardButton(
@@ -183,8 +234,18 @@ async def handle_interactive_ui(
     if not content:
         return False
 
-    # Build message with navigation keyboard
-    keyboard = _build_interactive_keyboard(window_id, ui_name=content.name)
+    # Unchanged content already posted → nothing to do. This makes the
+    # status poller's per-tick refresh (self-healing) essentially free.
+    existing_msg_id = _interactive_msgs.get(ikey)
+    if existing_msg_id and _interactive_content.get(ikey) == content.content:
+        _interactive_mode[ikey] = window_id
+        return True
+
+    # Build message with per-option buttons + navigation keyboard
+    options = parse_numbered_options(content.content)
+    keyboard = _build_interactive_keyboard(
+        window_id, ui_name=content.name, options=options
+    )
 
     # Send as plain text (no markdown conversion)
     text = content.content
@@ -195,7 +256,6 @@ async def handle_interactive_ui(
         thread_kwargs["message_thread_id"] = thread_id
 
     # Check if we have an existing interactive message to edit
-    existing_msg_id = _interactive_msgs.get(ikey)
     if existing_msg_id:
         try:
             await bot.edit_message_text(
@@ -206,11 +266,13 @@ async def handle_interactive_ui(
                 link_preview_options=NO_LINK_PREVIEW,
             )
             _interactive_mode[ikey] = window_id
+            _interactive_content[ikey] = content.content
             return True
         except BadRequest as e:
             if "Message is not modified" in str(e):
                 # Content unchanged — keep existing message as-is
                 _interactive_mode[ikey] = window_id
+                _interactive_content[ikey] = content.content
                 return True
             # Other edit failure — fall through to send new message,
             # but keep old message until replacement succeeds
@@ -247,6 +309,7 @@ async def handle_interactive_ui(
     if sent:
         _interactive_msgs[ikey] = sent.message_id
         _interactive_mode[ikey] = window_id
+        _interactive_content[ikey] = content.content
         # New message sent successfully — now safe to delete the old one
         if existing_msg_id:
             try:
@@ -266,6 +329,7 @@ async def clear_interactive_msg(
     ikey = (user_id, thread_id or 0)
     msg_id = _interactive_msgs.pop(ikey, None)
     _interactive_mode.pop(ikey, None)
+    _interactive_content.pop(ikey, None)
     logger.debug(
         "Clear interactive msg: user=%d, thread=%s, msg_id=%s",
         user_id,

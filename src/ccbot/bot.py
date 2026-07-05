@@ -93,6 +93,7 @@ from .handlers.callback_data import (
     CB_ASK_ENTER,
     CB_ASK_ESC,
     CB_ASK_LEFT,
+    CB_ASK_NUM,
     CB_ASK_REFRESH,
     CB_ASK_RIGHT,
     CB_ASK_SPACE,
@@ -103,10 +104,13 @@ from .handlers.callback_data import (
     CB_DIR_PAGE,
     CB_DIR_SELECT,
     CB_DIR_UP,
+    CB_EFFORT_CANCEL,
+    CB_EFFORT_SET,
     CB_HISTORY_NEXT,
     CB_HISTORY_PREV,
     CB_KILLALL_CANCEL,
     CB_KILLALL_CONFIRM,
+    CB_SESSION_ALL,
     CB_SESSION_CANCEL,
     CB_SESSION_NEW,
     CB_SESSION_SELECT,
@@ -148,6 +152,7 @@ from .handlers.interactive_ui import (
     clear_interactive_mode,
     clear_interactive_msg,
     get_interactive_msg_id,
+    get_interactive_option_label,
     get_interactive_window,
     handle_interactive_ui,
     set_interactive_mode,
@@ -406,6 +411,73 @@ async def esc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     # Send Escape control character (no enter)
     await tmux_manager.send_keys(w.window_id, "\x1b", enter=False)
     await safe_reply(update.message, "⎋ Sent Escape")
+
+
+# Claude Code reasoning-effort levels, in ascending order. Kept in sync with
+# the TUI's /effort dialog (verified 2026-07-05: `/effort <level>` is a valid
+# one-shot — it applies immediately and persists as the account default).
+EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+
+
+def _read_default_effort() -> str:
+    """Current default effort from ~/.claude/settings.json ('' if unknown).
+
+    Claude Code persists the last `/effort` choice as `effortLevel` there;
+    per-session overrides aren't readable from outside the TUI, so this is
+    the best "current" indicator available.
+    """
+    try:
+        settings = json.loads(
+            (Path.home() / ".claude" / "settings.json").read_text(encoding="utf-8")
+        )
+        return str(settings.get("effortLevel", ""))
+    except (OSError, json.JSONDecodeError):
+        return ""
+
+
+def _build_effort_keyboard() -> InlineKeyboardMarkup:
+    current = _read_default_effort()
+    rows: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for level in EFFORT_LEVELS:
+        label = f"✓ {level}" if level == current else level
+        row.append(InlineKeyboardButton(label, callback_data=f"{CB_EFFORT_SET}{level}"))
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("Cancel", callback_data=CB_EFFORT_CANCEL)])
+    return InlineKeyboardMarkup(rows)
+
+
+async def effort_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Pick a reasoning-effort level for this topic's Claude session."""
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+    if not update.message:
+        return
+
+    thread_id = _get_thread_id(update)
+    wid = session_manager.resolve_window_for_thread(user.id, thread_id)
+    if not wid:
+        await safe_reply(update.message, "❌ No session bound to this topic.")
+        return
+
+    w = await tmux_manager.find_window_by_id(wid)
+    if not w:
+        display = session_manager.get_display_name(wid)
+        await safe_reply(update.message, f"❌ Window '{display}' no longer exists.")
+        return
+
+    current = _read_default_effort()
+    current_line = f"\ncurrent default: `{current}`" if current else ""
+    await safe_reply(
+        update.message,
+        f"*Effort level*{current_line}\n\nPick the reasoning effort for this session:",
+        reply_markup=_build_effort_keyboard(),
+    )
 
 
 async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2370,11 +2442,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         sessions = await session_manager.list_sessions_for_directory(selected_path)
         if sessions:
             # Show session picker — store state for later
+            total = session_manager.count_session_files_for_directory(selected_path)
             if context.user_data is not None:
                 context.user_data[STATE_KEY] = STATE_SELECTING_SESSION
                 context.user_data[SESSIONS_KEY] = sessions
                 context.user_data["_selected_path"] = selected_path
-            text, keyboard = build_session_picker(sessions)
+            text, keyboard = build_session_picker(sessions, total_count=total)
             await safe_edit(query, text, reply_markup=keyboard)
             await query.answer()
             return
@@ -2494,6 +2567,32 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             pending_tid,
             resume_session_id=session.session_id,
         )
+
+    elif data == CB_SESSION_ALL:
+        # Expand the picker to every conversation in this directory
+        pending_tid = (
+            context.user_data.get("_pending_thread_id") if context.user_data else None
+        )
+        if pending_tid is not None and _get_thread_id(update) != pending_tid:
+            await query.answer("Stale picker (topic mismatch)", show_alert=True)
+            return
+        selected_path = (
+            context.user_data.get("_selected_path", str(Path.cwd()))
+            if context.user_data
+            else str(Path.cwd())
+        )
+        all_sessions = await session_manager.list_sessions_for_directory(
+            selected_path, limit=None
+        )
+        if not all_sessions:
+            await query.answer("No sessions found")
+            return
+        if context.user_data is not None:
+            context.user_data[STATE_KEY] = STATE_SELECTING_SESSION
+            context.user_data[SESSIONS_KEY] = all_sessions
+        text, keyboard = build_session_picker(all_sessions, showing_all=True)
+        await safe_edit(query, text, reply_markup=keyboard)
+        await query.answer(f"{len(all_sessions)} conversations")
 
     elif data == CB_SESSION_NEW:
         pending_tid = (
@@ -2678,6 +2777,67 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     elif data == "noop":
         await query.answer()
+
+    # /effort: level picked
+    elif data.startswith(CB_EFFORT_SET):
+        level = data[len(CB_EFFORT_SET) :]
+        if level not in EFFORT_LEVELS:
+            await query.answer("Invalid level")
+            return
+        thread_id = _get_thread_id(update)
+        wid = session_manager.resolve_window_for_thread(user.id, thread_id)
+        if not wid:
+            await safe_edit(query, "❌ No session bound to this topic.")
+            await query.answer()
+            return
+        w = await tmux_manager.find_window_by_id(wid)
+        if not w:
+            await safe_edit(query, "❌ Window no longer exists.")
+            await query.answer()
+            return
+        display = session_manager.get_display_name(wid)
+        success, message = await session_manager.send_to_window(wid, f"/effort {level}")
+        if success:
+            await safe_edit(query, f"⚡ [{display}] effort → *{level}*")
+            await query.answer(f"effort → {level}")
+        else:
+            await safe_edit(query, f"❌ {message}")
+            await query.answer("Failed", show_alert=True)
+
+    elif data == CB_EFFORT_CANCEL:
+        await safe_edit(query, "Cancelled")
+        await query.answer("Cancelled")
+
+    # Interactive UI: press an option number directly. Digits both select
+    # and confirm in Claude Code choice dialogs (verified live 2026-07-05).
+    # Free-text options ("Type something.", "Chat about this") only focus
+    # the dialog's input — tell the user their next message fills it.
+    elif data.startswith(CB_ASK_NUM):
+        rest = data[len(CB_ASK_NUM) :]
+        digit, _, window_id = rest.partition(":")
+        thread_id = _get_thread_id(update)
+        label = get_interactive_option_label(
+            user.id, thread_id, int(digit) if digit.isdigit() else -1
+        )
+        w = await tmux_manager.find_window_by_id(window_id)
+        if w and digit.isdigit():
+            await tmux_manager.send_keys(w.window_id, digit, enter=False)
+            await asyncio.sleep(0.6)
+            await _refresh_interactive_or_fallback(
+                context.bot, user.id, window_id, thread_id
+            )
+            if label and label.lower().rstrip(".…").strip() in (
+                "type something",
+                "chat about this",
+            ):
+                await query.answer(
+                    f"{digit}. {label} — now send your text as a normal message",
+                    show_alert=False,
+                )
+            else:
+                await query.answer(f"▶ {digit}. {label or ''}"[:200])
+        else:
+            await query.answer("Window no longer exists", show_alert=True)
 
     # Interactive UI: Up arrow
     elif data.startswith(CB_ASK_UP):
@@ -2985,6 +3145,7 @@ async def post_init(application: Application) -> None:
         BotCommand("screenshot", "Terminal screenshot with control keys"),
         BotCommand("term", "Terminal pane text as a code block"),
         BotCommand("esc", "Send Escape to interrupt Claude"),
+        BotCommand("effort", "Pick reasoning effort (low…max)"),
         BotCommand("kill", "Kill session and delete topic"),
         BotCommand("unbind", "Unbind topic from session (keeps window running)"),
         BotCommand("dashboard", "Recreate the live terminal dashboard"),
@@ -3144,6 +3305,7 @@ def create_bot() -> Application:
     application.add_handler(CommandHandler("screenshot", screenshot_command))
     application.add_handler(CommandHandler("term", term_command))
     application.add_handler(CommandHandler("esc", esc_command))
+    application.add_handler(CommandHandler("effort", effort_command))
     application.add_handler(CommandHandler("unbind", unbind_command))
     application.add_handler(CommandHandler("usage", usage_command))
     application.add_handler(CommandHandler("dashboard", dashboard_command))

@@ -28,6 +28,7 @@ from .callback_data import (
     CB_DIR_PAGE,
     CB_DIR_SELECT,
     CB_DIR_UP,
+    CB_SESSION_ALL,
     CB_SESSION_CANCEL,
     CB_SESSION_NEW,
     CB_SESSION_SELECT,
@@ -212,45 +213,85 @@ def _relative_time(file_path: str) -> str:
     return f"{d}d ago"
 
 
+# Button label budget for session titles — one button per row, so nearly
+# the full row width is available; Telegram clips visually past ~40 chars
+# on phones, so keep the head of the title readable.
+SESSION_BUTTON_LABEL_LIMIT = 48
+
+# Text block budget — stay well under Telegram's 4096-char message limit
+# even in the "All" view.
+_PICKER_TEXT_LIMIT = 3500
+
+# Telegram allows at most 100 buttons per inline keyboard; leave room for
+# the action rows.
+MAX_SESSION_BUTTONS = 96
+
+
 def build_session_picker(
     sessions: list[ClaudeSession],
+    total_count: int | None = None,
+    showing_all: bool = False,
 ) -> tuple[str, InlineKeyboardMarkup]:
     """Build session picker UI for resuming an existing Claude session.
 
+    One full-width button per conversation so the whole title is readable
+    (label: "N · title · age"). The message text lists the same entries
+    untruncated as backup for titles longer than a button can show.
+
     Args:
-        sessions: List of ClaudeSession objects (sorted by recency).
+        sessions: ClaudeSession list (sorted by recency), already capped
+            by the caller for the default view.
+        total_count: total sessions in this directory (None = unknown);
+            when more exist than shown, an "All" button is offered.
+        showing_all: True when this IS the expanded all-sessions view.
 
     Returns: (text, keyboard).
     """
-    lines = [
-        "*Resume Session?*\n",
-        "Existing sessions found in this directory.\n",
-    ]
-    for i, s in enumerate(sessions):
-        summary = s.summary[:40] + "…" if len(s.summary) > 40 else s.summary
+    shown = sessions[:MAX_SESSION_BUTTONS]
+    header = "*Resume a conversation*" if not showing_all else "*All conversations*"
+    lines = [f"{header}\n"]
+
+    body_lines: list[str] = []
+    body_budget = _PICKER_TEXT_LIMIT - len(header)
+    for i, s in enumerate(shown):
         rel = _relative_time(s.file_path)
-        time_str = f" ({rel})" if rel else ""
-        lines.append(f"{i + 1}. {summary} — {s.message_count} msgs{time_str}")
+        time_str = f" · {rel}" if rel else ""
+        line = f"{i + 1}. {s.summary} — {s.message_count} msgs{time_str}"
+        if body_budget - len(line) - 1 <= 0:
+            body_lines.append("…")
+            break
+        body_lines.append(line)
+        body_budget -= len(line) + 1
+    lines.extend(body_lines)
+    if len(shown) < len(sessions):
+        lines.append(f"\n_(showing first {len(shown)} of {len(sessions)})_")
 
     buttons: list[list[InlineKeyboardButton]] = []
-    for i in range(0, len(sessions), 2):
-        row = []
-        for j in range(min(2, len(sessions) - i)):
-            s = sessions[i + j]
-            label = s.summary[:14] + "…" if len(s.summary) > 14 else s.summary
-            row.append(
+    for i, s in enumerate(shown):
+        rel = _relative_time(s.file_path)
+        suffix = f" · {rel}" if rel else ""
+        title_budget = SESSION_BUTTON_LABEL_LIMIT - len(suffix) - len(f"{i + 1} · ")
+        title = s.summary
+        if len(title) > title_budget:
+            title = title[: max(title_budget - 1, 1)].rstrip() + "…"
+        buttons.append(
+            [
                 InlineKeyboardButton(
-                    f"▶ {label}", callback_data=f"{CB_SESSION_SELECT}{i + j}"
+                    f"{i + 1} · {title}{suffix}",
+                    callback_data=f"{CB_SESSION_SELECT}{i}",
                 )
-            )
-        buttons.append(row)
+            ]
+        )
 
-    buttons.append(
-        [
-            InlineKeyboardButton("➕ New Session", callback_data=CB_SESSION_NEW),
-            InlineKeyboardButton("Cancel", callback_data=CB_SESSION_CANCEL),
-        ]
-    )
+    action_row = [InlineKeyboardButton("➕ New", callback_data=CB_SESSION_NEW)]
+    if not showing_all and total_count is not None and total_count > len(sessions):
+        action_row.append(
+            InlineKeyboardButton(
+                f"📋 All ({total_count})", callback_data=CB_SESSION_ALL
+            )
+        )
+    action_row.append(InlineKeyboardButton("Cancel", callback_data=CB_SESSION_CANCEL))
+    buttons.append(action_row)
 
     text = "\n".join(lines)
     return text, InlineKeyboardMarkup(buttons)

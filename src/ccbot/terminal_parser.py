@@ -197,6 +197,36 @@ def is_interactive_ui(pane_text: str) -> bool:
     return extract_interactive_content(pane_text) is not None
 
 
+# Numbered option line: "❯ 1. Yes", "  2. Type something." — the cursor
+# marker is optional, the number is single/double digit, label follows.
+# Indented continuation lines (option descriptions) don't match because
+# they never start with "<digit>."
+_RE_NUMBERED_OPTION = re.compile(r"^\s*(?:❯\s*)?(\d{1,2})\.\s+(\S.*)$")
+
+
+def parse_numbered_options(content: str) -> list[tuple[int, str]]:
+    """Extract numbered options from interactive-UI content.
+
+    Claude Code's choice dialogs (AskUserQuestion, permission prompts,
+    ExitPlanMode) list options as "N. label" lines, and pressing the digit
+    key selects that option directly. Returns (number, first-line label)
+    pairs in on-screen order; wrapped label continuations and description
+    lines are ignored. Duplicate numbers (shouldn't happen) keep the first.
+    """
+    options: list[tuple[int, str]] = []
+    seen: set[int] = set()
+    for line in content.split("\n"):
+        m = _RE_NUMBERED_OPTION.match(line)
+        if not m:
+            continue
+        num = int(m.group(1))
+        if num in seen:
+            continue
+        seen.add(num)
+        options.append((num, m.group(2).strip()))
+    return options
+
+
 # ── Unrecognized dialog fallback ─────────────────────────────────────────
 #
 # Detects a full-screen dialog ccbot has no specific parser for (the

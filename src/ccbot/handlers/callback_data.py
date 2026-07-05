@@ -38,6 +38,7 @@ CB_SCREENSHOT_REFRESH = "ss:ref:"
 CB_TERM_REFRESH = "tm:ref:"
 
 # Interactive UI (aq: prefix kept for backward compatibility)
+CB_ASK_NUM = "aq:num:"  # aq:num:<digit>:<window> — press option number directly
 CB_ASK_UP = "aq:up:"  # aq:up:<window>
 CB_ASK_DOWN = "aq:down:"  # aq:down:<window>
 CB_ASK_LEFT = "aq:left:"  # aq:left:<window>
@@ -52,6 +53,11 @@ CB_ASK_REFRESH = "aq:ref:"  # aq:ref:<window>
 CB_SESSION_SELECT = "rs:sel:"  # rs:sel:<index>
 CB_SESSION_NEW = "rs:new"  # start a new session
 CB_SESSION_CANCEL = "rs:cancel"  # cancel
+CB_SESSION_ALL = "rs:all"  # expand to ALL sessions (default view caps at 10)
+
+# /effort level picker
+CB_EFFORT_SET = "ef:set:"  # ef:set:<level>
+CB_EFFORT_CANCEL = "ef:cancel"
 
 # Screenshot control keys
 CB_KEYS_PREFIX = "kb:"  # kb:<key_id>:<window>

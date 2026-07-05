@@ -215,7 +215,11 @@ async def update_status_message(
     if interactive_window == window_id:
         # User is in interactive mode for THIS window
         if is_interactive_ui(pane_text):
-            # Interactive UI still showing — skip status update (user is interacting)
+            # Interactive UI still showing — refresh it (self-healing: no-op
+            # while content is unchanged thanks to the content cache; edits
+            # the message when the dialog content changed, e.g. cursor moved
+            # to another tab; re-sends if the message was deleted).
+            await handle_interactive_ui(bot, user_id, window_id, thread_id)
             return
         # Interactive UI gone — clear interactive mode, fall through to status check.
         # Don't re-check for new UI this cycle (the old one just disappeared).
@@ -332,7 +336,11 @@ async def status_poll_loop(bot: Bot) -> None:
                         skip_status=skip_status,
                     )
                 except Exception as e:
-                    logger.debug(
+                    # warning, not debug: a silent per-binding failure here
+                    # means input dialogs never reach Telegram (13-minute
+                    # undelivered AskUserQuestion, 2026-07-05) — it must be
+                    # visible in the journal at default log levels.
+                    logger.warning(
                         f"Status update error for user {user_id} "
                         f"thread {thread_id}: {e}"
                     )

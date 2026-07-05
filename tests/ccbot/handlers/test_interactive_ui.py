@@ -33,13 +33,19 @@ def mock_bot():
 @pytest.fixture
 def _clear_interactive_state():
     """Ensure interactive state is clean before and after each test."""
-    from ccbot.handlers.interactive_ui import _interactive_mode, _interactive_msgs
+    from ccbot.handlers.interactive_ui import (
+        _interactive_content,
+        _interactive_mode,
+        _interactive_msgs,
+    )
 
     _interactive_mode.clear()
     _interactive_msgs.clear()
+    _interactive_content.clear()
     yield
     _interactive_mode.clear()
     _interactive_msgs.clear()
+    _interactive_content.clear()
 
 
 @pytest.mark.usefixtures("_clear_interactive_state")
