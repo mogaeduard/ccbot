@@ -72,6 +72,7 @@ class TmuxManager:
         if session:
             self._scrub_session_env(session)
             self._ensure_main_window_placement(session)
+            self._set_default_size(session)
             return session
 
         # Create new session with the main (placeholder) window named in the
@@ -87,7 +88,22 @@ class TmuxManager:
         )
         self._ensure_main_window_placement(session)
         self._scrub_session_env(session)
+        self._set_default_size(session)
         return session
+
+    def _set_default_size(self, session: libtmux.Session) -> None:
+        """Give detached windows a tall default size (80x24 otherwise).
+
+        At 80x24, a long AskUserQuestion dialog plus the pinned task list
+        pushes the dialog's "☐ <header>" line out of the viewport, which
+        degrades interactive-UI detection and clips /term and /screenshot
+        output. Attached clients still win (window-size latest) — this
+        only affects windows no client is viewing.
+        """
+        try:
+            session.cmd("set-option", "-t", self.session_name, "default-size", "200x50")
+        except Exception as e:
+            logger.debug("Failed to set default-size: %s", e)
 
     @staticmethod
     def _ensure_main_window_placement(session: libtmux.Session) -> None:

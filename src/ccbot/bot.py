@@ -2821,18 +2821,27 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         w = await tmux_manager.find_window_by_id(window_id)
         if w and digit.isdigit():
+            is_text_option = bool(label) and label.lower().rstrip(".…").strip() in (
+                "type something",
+                "chat about this",
+            )
             await tmux_manager.send_keys(w.window_id, digit, enter=False)
+            if is_text_option:
+                # Digits only SELECT free-text options (regular options
+                # select+confirm) — press Enter to actually open the input
+                # box, then the user's next plain message is typed into it.
+                await asyncio.sleep(0.4)
+                await tmux_manager.send_keys(
+                    w.window_id, "Enter", enter=False, literal=False
+                )
             await asyncio.sleep(0.6)
             await _refresh_interactive_or_fallback(
                 context.bot, user.id, window_id, thread_id
             )
-            if label and label.lower().rstrip(".…").strip() in (
-                "type something",
-                "chat about this",
-            ):
+            if is_text_option:
                 await query.answer(
                     f"{digit}. {label} — now send your text as a normal message",
-                    show_alert=False,
+                    show_alert=True,
                 )
             else:
                 await query.answer(f"▶ {digit}. {label or ''}"[:200])

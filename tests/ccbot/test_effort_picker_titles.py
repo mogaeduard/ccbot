@@ -58,6 +58,47 @@ class TestParseNumberedOptions:
         assert parse_numbered_options("no options here") == []
 
 
+# 80x24 pane + pinned task list: the "☐ <header>" line and question text are
+# clipped above the viewport (captured live 2026-07-05 14:10). Must still be
+# detected as AskUserQuestion — NOT PermissionPrompt (option 1 starting with
+# "Yes" used to trip that pattern) and NOT nothing (this morning's 13-minute
+# undelivered question).
+CLIPPED_DIALOG = """\
+topic with tappable numbered option buttons?
+❯ 1. Yes - buttons in Telegram
+     The dialog showed up in the topic with one button per option and you are
+     answering by tapping one.
+  2. No - answering from terminal
+     Nothing appeared in Telegram (again); you are answering in the terminal
+     like before.
+  3. Appeared but broken
+     Something showed up in Telegram but buttons are missing, mislabeled, or
+     don't work.
+  4. Type something.
+────────────────────────────────────────────────────────────────────────────────
+  5. Chat about this
+Enter to select · ↑/↓ to navigate · Esc to cancel
+  5 tasks (4 done, 1 open)
+  ✔ Add interactive /effort command to ccbot"""
+
+
+class TestClippedDialogDetection:
+    def test_detected_as_ask_user_question(self) -> None:
+        from ccbot.terminal_parser import extract_interactive_content
+
+        content = extract_interactive_content(CLIPPED_DIALOG)
+        assert content is not None
+        assert content.name == "AskUserQuestion"
+        options = parse_numbered_options(content.content)
+        assert [n for n, _ in options] == [1, 2, 3, 4, 5]
+
+    def test_plain_numbered_list_without_footer_not_detected(self) -> None:
+        from ccbot.terminal_parser import extract_interactive_content
+
+        prose = "Here is my plan:\n1. First step\n2. Second step\n3. Third step\ndone."
+        assert extract_interactive_content(prose) is None
+
+
 class TestInteractiveKeyboardOptions:
     def test_option_rows_come_first_one_per_row(self) -> None:
         options = parse_numbered_options(DIALOG)

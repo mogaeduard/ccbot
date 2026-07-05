@@ -97,6 +97,15 @@ _last_typing_sent: dict[tuple[int, int], float] = {}
 # Last time a binding was actively probed for deletion via editForumTopic.
 _last_probed: dict[tuple[int, int], float] = {}
 
+# Consecutive poll ticks a tracked interactive UI has been unparseable
+# before its Telegram widget is cleared. Dialog SUB-STATES (e.g. the
+# free-text input after picking "Type something") match no UI pattern —
+# clearing on the first miss deleted the widget mid-interaction
+# (observed live 2026-07-05). ~4s of grace lets sub-states and redraw
+# flicker pass while still clearing promptly once the dialog is gone.
+UI_CLEAR_GRACE_TICKS = 4
+_ui_miss_counts: dict[tuple[int, int], int] = {}
+
 
 async def _send_typing_action(bot: Bot, user_id: int, thread_id: int) -> bool:
     """Send a TYPING chat action. Returns False if it failed because the
@@ -212,6 +221,7 @@ async def update_status_message(
     interactive_window = get_interactive_window(user_id, thread_id)
     should_check_new_ui = True
 
+    ukey = (user_id, thread_id or 0)
     if interactive_window == window_id:
         # User is in interactive mode for THIS window
         if is_interactive_ui(pane_text):
@@ -219,16 +229,28 @@ async def update_status_message(
             # while content is unchanged thanks to the content cache; edits
             # the message when the dialog content changed, e.g. cursor moved
             # to another tab; re-sends if the message was deleted).
+            _ui_miss_counts.pop(ukey, None)
             await handle_interactive_ui(bot, user_id, window_id, thread_id)
+            return
+        # No parseable UI this tick — could be genuinely gone, or an
+        # unparseable sub-state (text input open). Hold the widget for a
+        # few ticks before clearing (see UI_CLEAR_GRACE_TICKS).
+        misses = _ui_miss_counts.get(ukey, 0) + 1
+        _ui_miss_counts[ukey] = misses
+        if misses < UI_CLEAR_GRACE_TICKS:
             return
         # Interactive UI gone — clear interactive mode, fall through to status check.
         # Don't re-check for new UI this cycle (the old one just disappeared).
+        _ui_miss_counts.pop(ukey, None)
         await clear_interactive_msg(user_id, bot, thread_id)
         should_check_new_ui = False
     elif interactive_window is not None:
         # User is in interactive mode for a DIFFERENT window (window switched)
         # Clear stale interactive mode
+        _ui_miss_counts.pop(ukey, None)
         await clear_interactive_msg(user_id, bot, thread_id)
+    else:
+        _ui_miss_counts.pop(ukey, None)
 
     # Check for permission prompt (interactive UI not triggered via JSONL)
     # ALWAYS check UI, regardless of skip_status

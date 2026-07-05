@@ -76,6 +76,18 @@ UI_PATTERNS: list[UIPattern] = [
         min_gap=1,
     ),
     UIPattern(
+        # Clipped AskUserQuestion: in a short pane (80x24 + pinned task list)
+        # the "☐ <header>" line and the question text scroll out of the
+        # viewport, leaving only numbered options + the "Enter to select"
+        # footer (observed live 2026-07-05, twice). Anchor on the first
+        # numbered option instead; the footer requirement keeps ordinary
+        # numbered lists in transcript text from matching.
+        name="AskUserQuestion",
+        top=(re.compile(r"^\s*(?:❯\s*)?\d{1,2}\.\s+\S"),),
+        bottom=(re.compile(r"^\s*Enter to select"),),
+        min_gap=1,
+    ),
+    UIPattern(
         name="PermissionPrompt",
         top=(
             re.compile(r"^\s*Do you want to proceed\?"),
