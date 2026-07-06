@@ -1050,6 +1050,19 @@ async def speak_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await safe_reply(update.message, "🔇 Nothing to speak yet in this terminal.")
         return
 
+    # Optional speaking-speed argument: "/speak 0.8" or "/speak 1.5x"
+    # (0.5-2.0; the TTS server rescales the model's duration prediction, so
+    # pitch is untouched). No argument keeps the server's default speed.
+    speed: float | None = None
+    if context.args:
+        m = re.fullmatch(r"(\d+(?:[.,]\d+)?)x?", context.args[0].strip().lower())
+        if not m:
+            await safe_reply(
+                update.message, "Usage: /speak [speed], e.g. /speak 0.8 or /speak 1.5x"
+            )
+            return
+        speed = min(2.0, max(0.5, float(m.group(1).replace(",", "."))))
+
     # Detect on the raw answer, before summarizing shortens/paraphrases it —
     # both the summarizer and the TTS server are then told the language
     # explicitly instead of re-guessing.
@@ -1070,9 +1083,10 @@ async def speak_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     try:
         client = httpx.AsyncClient(timeout=120.0)
         try:
-            resp = await client.post(
-                TTS_SPEAK_URL, json={"text": text, "language": language}
-            )
+            payload = {"text": text, "language": language}
+            if speed is not None:
+                payload["speed"] = speed
+            resp = await client.post(TTS_SPEAK_URL, json=payload)
             resp.raise_for_status()
             audio = resp.content
         finally:
@@ -3266,7 +3280,7 @@ async def post_init(application: Application) -> None:
     bot_commands = [
         BotCommand("start", "Show welcome message"),
         BotCommand("new", "Start Claude in <project> (anywhere in the group)"),
-        BotCommand("speak", "Voice-note summary of the last answer"),
+        BotCommand("speak", "Voice-note of the last answer; optional speed, e.g. /speak 0.8"),
         BotCommand("history", "Message history for this topic"),
         BotCommand("screenshot", "Terminal screenshot with control keys"),
         BotCommand("term", "Terminal pane text as a code block"),

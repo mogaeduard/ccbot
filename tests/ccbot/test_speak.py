@@ -239,9 +239,12 @@ def _make_speak_update(user_id: int = 1) -> MagicMock:
     return update
 
 
-def _make_context() -> MagicMock:
+def _make_context(args: list[str] | None = None) -> MagicMock:
     context = MagicMock()
     context.bot = AsyncMock()
+    # Real PTB always provides a list here (possibly empty) — a bare MagicMock
+    # would be truthy and wrongly enter the optional-speed-argument branch.
+    context.args = args or []
     return context
 
 
@@ -278,6 +281,73 @@ class TestSpeakCommandFlow:
         sent_text = mock_post.call_args.kwargs["json"]["text"]
         assert sent_text == "Short answer."
         update.message.reply_voice.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_no_speed_argument_omits_speed_from_payload(self) -> None:
+        update = _make_speak_update()
+        messages = [_m("assistant", "text", "Short answer.")]
+        with (
+            patch("ccbot.bot.is_user_allowed", return_value=True),
+            patch("ccbot.bot._get_thread_id", return_value=42),
+            patch("ccbot.bot.session_manager") as mock_sm,
+            patch.object(
+                httpx.AsyncClient,
+                "post",
+                new_callable=AsyncMock,
+                return_value=_mock_tts_response(),
+            ) as mock_post,
+        ):
+            mock_sm.get_window_for_thread.return_value = "@1"
+            mock_sm.get_recent_messages = AsyncMock(return_value=(messages, None))
+            await bot.speak_command(update, _make_context())
+
+        # The server's TTS_DEFAULT_SPEED must govern when no argument is given.
+        assert "speed" not in mock_post.call_args.kwargs["json"]
+
+    @pytest.mark.asyncio
+    async def test_speed_argument_is_parsed_clamped_and_sent(self) -> None:
+        update = _make_speak_update()
+        messages = [_m("assistant", "text", "Short answer.")]
+        for raw, expected in (("0.8", 0.8), ("1.5x", 1.5), ("0,7", 0.7), ("9", 2.0), ("0.1", 0.5)):
+            with (
+                patch("ccbot.bot.is_user_allowed", return_value=True),
+                patch("ccbot.bot._get_thread_id", return_value=42),
+                patch("ccbot.bot.session_manager") as mock_sm,
+                patch.object(
+                    httpx.AsyncClient,
+                    "post",
+                    new_callable=AsyncMock,
+                    return_value=_mock_tts_response(),
+                ) as mock_post,
+            ):
+                mock_sm.get_window_for_thread.return_value = "@1"
+                mock_sm.get_recent_messages = AsyncMock(return_value=(messages, None))
+                await bot.speak_command(update, _make_context([raw]))
+
+            assert mock_post.call_args.kwargs["json"]["speed"] == expected, raw
+
+    @pytest.mark.asyncio
+    async def test_invalid_speed_argument_replies_usage_and_skips_tts(self) -> None:
+        update = _make_speak_update()
+        messages = [_m("assistant", "text", "Short answer.")]
+        with (
+            patch("ccbot.bot.is_user_allowed", return_value=True),
+            patch("ccbot.bot._get_thread_id", return_value=42),
+            patch("ccbot.bot.session_manager") as mock_sm,
+            patch("ccbot.bot.safe_reply", new_callable=AsyncMock) as mock_reply,
+            patch.object(
+                httpx.AsyncClient,
+                "post",
+                new_callable=AsyncMock,
+                return_value=_mock_tts_response(),
+            ) as mock_post,
+        ):
+            mock_sm.get_window_for_thread.return_value = "@1"
+            mock_sm.get_recent_messages = AsyncMock(return_value=(messages, None))
+            await bot.speak_command(update, _make_context(["fast"]))
+
+        mock_post.assert_not_called()
+        assert "Usage" in mock_reply.call_args.args[1]
 
     @pytest.mark.asyncio
     async def test_long_answer_uses_cli_summary(self) -> None:
