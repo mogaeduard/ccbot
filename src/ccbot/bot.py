@@ -229,6 +229,7 @@ CC_COMMANDS: dict[str, str] = {
     "help": "↗ Show Claude Code help",
     "memory": "↗ Edit CLAUDE.md",
     "model": "↗ Switch AI model",
+    "sync": "↗ Sync the ~/mind shared brain now",
 }
 
 
