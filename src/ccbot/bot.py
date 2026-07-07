@@ -1519,7 +1519,9 @@ async def forward_command_handler(
         "Forwarding command %s to window %s (user=%d)", cc_slash, display, user.id
     )
     try:
-        await update.message.chat.send_action(ChatAction.TYPING)
+        await update.message.chat.send_action(
+            ChatAction.TYPING, message_thread_id=thread_id
+        )
     except Exception as e:
         logger.warning("send_action(TYPING) failed, continuing to injection: %s", e)
     success, message = await session_manager.send_to_window(wid, cc_slash)
@@ -1621,7 +1623,9 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         text_to_send = f"(image attached: {file_path})"
 
     try:
-        await update.message.chat.send_action(ChatAction.TYPING)
+        await update.message.chat.send_action(
+            ChatAction.TYPING, message_thread_id=thread_id
+        )
     except Exception as e:
         logger.warning("send_action(TYPING) failed, continuing to injection: %s", e)
     clear_status_msg_info(user.id, thread_id)

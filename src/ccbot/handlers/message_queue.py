@@ -501,7 +501,9 @@ async def _process_status_update_task(
             if "esc to interrupt" in status_text.lower():
                 try:
                     await bot.send_chat_action(
-                        chat_id=chat_id, action=ChatAction.TYPING
+                        chat_id=chat_id,
+                        action=ChatAction.TYPING,
+                        **_send_kwargs(task.thread_id),  # type: ignore[arg-type]
                     )
                 except RetryAfter:
                     raise
@@ -560,7 +562,11 @@ async def _do_send_status_message(
     # Send typing indicator when Claude is working
     if "esc to interrupt" in text.lower():
         try:
-            await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+            await bot.send_chat_action(
+                chat_id=chat_id,
+                action=ChatAction.TYPING,
+                **_send_kwargs(thread_id),  # type: ignore[arg-type]
+            )
         except RetryAfter:
             raise
         except Exception:
