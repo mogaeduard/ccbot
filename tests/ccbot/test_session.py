@@ -6,6 +6,7 @@ import pytest
 
 import ccbot.session as session_module
 from ccbot.session import SessionManager
+from ccbot.tmux_manager import TmuxWindow
 
 
 @pytest.fixture
@@ -360,3 +361,59 @@ class TestLockedStatePersistence:
         )
         mgr = SessionManager()
         assert mgr.is_locked() is False
+
+
+class TestResolveStaleIds:
+    """resolve_stale_ids re-maps topics across a tmux restart (window IDs
+    reset) by the stable Terminal-N number, and never orphans a topic: an
+    unmatched binding is retained so the mirror's dead-topic reconciler
+    deletes it rather than the binding being dropped and the topic stranded."""
+
+    def _live(self, monkeypatch, windows: list[TmuxWindow]) -> None:
+        monkeypatch.setattr(
+            session_module.tmux_manager,
+            "list_windows",
+            AsyncMock(return_value=windows),
+        )
+
+    @pytest.mark.asyncio
+    async def test_rematch_by_index_when_ai_title_drifts(
+        self, mgr: SessionManager, monkeypatch
+    ) -> None:
+        # Topic bound to old window @1, titled "1 — old title".
+        mgr.bind_thread(100, 10, "@1", window_name="1 — old title")
+        # After restart: same Terminal 1, new tmux id @9, drifted ai-title.
+        self._live(
+            monkeypatch,
+            [TmuxWindow("@9", "1 — new title", "/x", window_index="1")],
+        )
+        await mgr.resolve_stale_ids()
+        # Re-mapped to the live window by its number — reused, not orphaned.
+        assert mgr.get_window_for_thread(100, 10) == "@9"
+
+    @pytest.mark.asyncio
+    async def test_retains_binding_when_no_live_window(
+        self, mgr: SessionManager, monkeypatch
+    ) -> None:
+        mgr.bind_thread(100, 20, "@2", window_name="2 — foo")
+        # No live window matches the name OR the Terminal-2 number.
+        self._live(
+            monkeypatch,
+            [TmuxWindow("@9", "1 — bar", "/x", window_index="1")],
+        )
+        await mgr.resolve_stale_ids()
+        # Retained (still points at dead @2) so _close_dead_topics deletes the
+        # topic on its next tick — the old code dropped it and orphaned it.
+        assert mgr.get_window_for_thread(100, 20) == "@2"
+
+    @pytest.mark.asyncio
+    async def test_live_binding_kept(
+        self, mgr: SessionManager, monkeypatch
+    ) -> None:
+        mgr.bind_thread(100, 30, "@5", window_name="3 — baz")
+        self._live(
+            monkeypatch,
+            [TmuxWindow("@5", "3 — baz", "/x", window_index="3")],
+        )
+        await mgr.resolve_stale_ids()
+        assert mgr.get_window_for_thread(100, 30) == "@5"

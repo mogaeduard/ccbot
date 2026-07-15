@@ -249,10 +249,19 @@ class SessionManager:
         """
         windows = await tmux_manager.list_windows()
         live_by_name: dict[str, str] = {}  # window_name -> window_id
+        live_by_index: dict[str, str] = {}  # window_index (Terminal N) -> window_id
         live_ids: set[str] = set()
         for w in windows:
             live_by_name[w.window_name] = w.window_id
+            if w.window_index:
+                live_by_index[w.window_index] = w.window_id
             live_ids.add(w.window_id)
+
+        def _index_prefix(name: str) -> str:
+            # Mirror topics are named "N — title"; the leading N is the stable
+            # Terminal number that survives restarts even when the ai-title drifts.
+            head = name.split("—", 1)[0].strip()
+            return head if head.isdigit() else ""
 
         changed = False
 
@@ -309,6 +318,13 @@ class SessionManager:
                     else:
                         display = self.window_display_names.get(val, val)
                         new_id = live_by_name.get(display)
+                        if not new_id:
+                            # Name match failed (ai-title drifted) — fall back to
+                            # the stable Terminal-N number so the SAME topic is
+                            # reused across restarts instead of orphaned + a
+                            # duplicate created. This is what stops the churn.
+                            idx = _index_prefix(display)
+                            new_id = live_by_index.get(idx) if idx else None
                         if new_id:
                             logger.info(
                                 "Re-resolved thread binding %s -> %s (name=%s)",
@@ -320,13 +336,20 @@ class SessionManager:
                             self.window_display_names[new_id] = display
                             changed = True
                         else:
+                            # No live window for this topic. KEEP the binding
+                            # (still pointing at the dead window_id) so the
+                            # mirror's _close_dead_topics deletes the Telegram
+                            # topic on its next tick. Dropping it here — the old
+                            # behaviour — orphaned the topic forever, which is
+                            # how hundreds of dead topics piled up.
+                            new_bindings[tid] = val
                             logger.info(
-                                "Dropping stale thread binding: user=%d, thread=%d, wid=%s",
+                                "Retaining dead thread binding for reconciler "
+                                "cleanup: user=%d, thread=%d, wid=%s",
                                 uid,
                                 tid,
                                 val,
                             )
-                            changed = True
                 else:
                     # Old format: val is window_name
                     new_id = live_by_name.get(val)
@@ -865,6 +888,9 @@ class SessionManager:
         window_id = bindings.pop(thread_id)
         if not bindings:
             del self.thread_bindings[user_id]
+        # Prune the routing map too, else it grows unbounded (every closed topic
+        # left a dead "user:thread" entry — that graveyard hit 160+ ghosts).
+        self.group_chat_ids.pop(f"{user_id}:{thread_id}", None)
         self._save_state()
         logger.info(
             "Unbound thread %d (was %s) for user %d",
