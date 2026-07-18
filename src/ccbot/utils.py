@@ -4,6 +4,7 @@ Provides:
   - ccbot_dir(): resolve config directory from CCBOT_DIR env var.
   - atomic_write_json(): crash-safe JSON file writes via temp+rename.
   - read_cwd_from_jsonl(): extract the cwd field from the first JSONL entry.
+  - slot_index(): parse the Terminal-N prefix out of an "N — title" name.
 """
 
 import json
@@ -47,6 +48,23 @@ def atomic_write_json(path: Path, data: Any, indent: int = 2) -> None:
         except OSError:
             pass
         raise
+
+
+def slot_index(name: str) -> str:
+    """Parse the stable Terminal-N slot number out of an "N — title" name.
+
+    Inverse of topic_titles.build_topic_name (which lives there because it
+    imports session; this parser sits in utils so session.py can use it
+    without a cycle). Returns "" when the name isn't slot-prefixed. The
+    real "—" separator is REQUIRED: a purely numeric window name (e.g. a
+    window literally named "3") must never be mistaken for a slot prefix —
+    that mistake rebound topics to arbitrary terminals after a restart.
+    """
+    head, sep, _ = name.partition("—")
+    if not sep:
+        return ""
+    head = head.strip()
+    return head if head.isdigit() else ""
 
 
 def read_cwd_from_jsonl(file_path: str | Path) -> str:

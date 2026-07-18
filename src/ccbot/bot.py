@@ -1052,16 +1052,14 @@ async def speak_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     # Optional speaking-speed argument: "/speak 0.8" or "/speak 1.5x"
     # (0.5-2.0; the TTS server rescales the model's duration prediction, so
-    # pitch is untouched). No argument keeps the server's default speed.
+    # pitch is untouched). Any non-numeric argument is ignored, like before
+    # the speed feature existed — "/speak now" must keep producing audio,
+    # not a usage lecture.
     speed: float | None = None
     if context.args:
         m = re.fullmatch(r"(\d+(?:[.,]\d+)?)x?", context.args[0].strip().lower())
-        if not m:
-            await safe_reply(
-                update.message, "Usage: /speak [speed], e.g. /speak 0.8 or /speak 1.5x"
-            )
-            return
-        speed = min(2.0, max(0.5, float(m.group(1).replace(",", "."))))
+        if m:
+            speed = min(2.0, max(0.5, float(m.group(1).replace(",", "."))))
 
     # Detect on the raw answer, before summarizing shortens/paraphrases it —
     # both the summarizer and the TTS server are then told the language
@@ -1083,7 +1081,7 @@ async def speak_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     try:
         client = httpx.AsyncClient(timeout=120.0)
         try:
-            payload = {"text": text, "language": language}
+            payload: dict[str, str | float] = {"text": text, "language": language}
             if speed is not None:
                 payload["speed"] = speed
             resp = await client.post(TTS_SPEAK_URL, json=payload)
@@ -1361,10 +1359,6 @@ async def topic_created_handler(
     if session_manager.get_window_for_thread(user.id, thread_id) is not None:
         return  # already bound (e.g. mirror-created topic) — nothing to do
 
-    chat = update.effective_chat
-    if chat and chat.type in ("group", "supergroup"):
-        session_manager.set_group_chat_id(user.id, thread_id, chat.id)
-
     topic_name = msg.forum_topic_created.name
     success, message, wname, wid = await tmux_manager.create_window(
         str(Path.home()), window_name=topic_name, start_claude=False
@@ -1373,6 +1367,12 @@ async def topic_created_handler(
         logger.error("Topic created: failed to create shell window: %s", message)
         await safe_reply(msg, f"⚠ Failed to create terminal: {message}")
         return
+
+    # Only record routing once the window exists — recording it before a
+    # failed create leaked a group_chat_ids entry with no binding behind it.
+    chat = update.effective_chat
+    if chat and chat.type in ("group", "supergroup"):
+        session_manager.set_group_chat_id(user.id, thread_id, chat.id)
 
     session_manager.bind_thread(user.id, thread_id, wid, window_name=wname)
     logger.info(
@@ -3280,7 +3280,9 @@ async def post_init(application: Application) -> None:
     bot_commands = [
         BotCommand("start", "Show welcome message"),
         BotCommand("new", "Start Claude in <project> (anywhere in the group)"),
-        BotCommand("speak", "Voice-note of the last answer; optional speed, e.g. /speak 0.8"),
+        BotCommand(
+            "speak", "Voice-note of the last answer; optional speed, e.g. /speak 0.8"
+        ),
         BotCommand("history", "Message history for this topic"),
         BotCommand("screenshot", "Terminal screenshot with control keys"),
         BotCommand("term", "Terminal pane text as a code block"),

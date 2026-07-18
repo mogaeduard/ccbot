@@ -42,9 +42,9 @@ from typing import Any
 import aiofiles
 
 from .config import config
-from .tmux_manager import tmux_manager
+from .tmux_manager import TmuxWindow, tmux_manager
 from .transcript_parser import TranscriptParser
-from .utils import atomic_write_json
+from .utils import atomic_write_json, slot_index
 
 logger = logging.getLogger(__name__)
 
@@ -135,6 +135,12 @@ class SessionManager:
     dashboard_message_id: int | None = None
     # Overnight-autonomy arm switch (see is_overnight_armed/set_overnight_armed).
     overnight_armed: bool = False
+    # tmux server start_time this state was saved under. Window ids are
+    # never recycled while one server lives, so when this matches at boot,
+    # persisted ids that are still live are trusted verbatim; when it
+    # differs (server restarted → ids reset AND recycled), they must pass
+    # the identity checks in resolve_stale_ids.
+    tmux_server_start: str = ""
 
     # How long an injection stays "fresh" for echo suppression (see
     # was_recently_injected). Not persisted — resets on restart, which is
@@ -167,6 +173,7 @@ class SessionManager:
             "locked": self.locked,
             "dashboard_message_id": self.dashboard_message_id,
             "overnight_armed": self.overnight_armed,
+            "tmux_server_start": self.tmux_server_start,
         }
         atomic_write_json(config.state_file, state)
         logger.debug("State saved to %s", config.state_file)
@@ -203,6 +210,7 @@ class SessionManager:
                 self.locked = bool(state.get("locked", False))
                 self.dashboard_message_id = state.get("dashboard_message_id")
                 self.overnight_armed = bool(state.get("overnight_armed", False))
+                self.tmux_server_start = str(state.get("tmux_server_start", ""))
 
                 # Detect old format: keys that don't look like window IDs
                 needs_migration = False
@@ -236,166 +244,303 @@ class SessionManager:
                 self.locked = False
                 self.dashboard_message_id = None
                 self.overnight_armed = False
+                self.tmux_server_start = ""
                 pass
 
     async def resolve_stale_ids(self) -> None:
         """Re-resolve persisted window IDs against live tmux windows.
 
-        Called on startup. Handles two cases:
-        1. Old-format migration: window_name keys → window_id keys
-        2. Stale IDs: window_id no longer exists but display name matches a live window
+        Called on startup, after a possible tmux server restart (window ids
+        reset AND get recycled — an id existing again does not mean it's
+        the same terminal). One binding-level resolution is computed first,
+        then applied to window_states, user_window_offsets and
+        window_display_names together, so the structures can never disagree
+        about where a terminal went (window_states diverging from
+        thread_bindings silently unroutes that terminal's Claude output).
 
-        Builds {window_name: window_id} from live windows, then remaps or drops entries.
+        Per binding: identity-checked id survival first, then display-name
+        match, then the stable Terminal-N slot prefix — the slot match
+        guarded by the remembered cwd when one is known (a different
+        project reopened in the same slot must NOT inherit the topic: the
+        user's next message would be keystrokes into the wrong live
+        session) — and each live window claimed at most once
+        (1 topic = 1 window).
+
+        Bindings with no surviving window are PARKED: the binding's value
+        is rewritten from the dead id to the topic's display name. A
+        parked value can never collide with a recycled tmux id, survives
+        further restarts, still carries its Terminal-N slot, and every
+        consumer already degrades gracefully on a non-id value
+        (find_window_by_id returns None). The Telegram topic and its
+        history are left untouched — the mirror adopts the parked binding
+        when a matching terminal reopens (adopt_parked_binding) and its
+        dead-topic cleanup only ever deletes real window ids. Feeding
+        startup-stale bindings to that cleanup destroyed real topics with
+        full histories after a partial terminal reopen (2026-07-17 review).
         """
         windows = await tmux_manager.list_windows()
-        live_by_name: dict[str, str] = {}  # window_name -> window_id
-        live_by_index: dict[str, str] = {}  # window_index (Terminal N) -> window_id
-        live_ids: set[str] = set()
-        for w in windows:
-            live_by_name[w.window_name] = w.window_id
-            if w.window_index:
-                live_by_index[w.window_index] = w.window_id
-            live_ids.add(w.window_id)
+        live_by_name: dict[str, TmuxWindow] = {w.window_name: w for w in windows}
+        live_by_index: dict[str, TmuxWindow] = {
+            w.window_index: w for w in windows if w.window_index
+        }
+        live_wins: dict[str, TmuxWindow] = {w.window_id: w for w in windows}
+        live_ids = set(live_wins)
 
-        def _index_prefix(name: str) -> str:
-            # Mirror topics are named "N — title"; the leading N is the stable
-            # Terminal number that survives restarts even when the ai-title drifts.
-            head = name.split("—", 1)[0].strip()
-            return head if head.isdigit() else ""
+        # Ids are never recycled while one tmux server lives: same server
+        # as last save (or none recorded — first boot after upgrade) means
+        # a persisted id that is still live IS its window, whatever the
+        # recorded display says (live display data has drifted
+        # historically). Only after a real server restart — ids reset AND
+        # recycled — must identity be proven, not assumed.
+        server_start = await tmux_manager.get_server_start_time()
+        trust_live_ids = (
+            not self.tmux_server_start or self.tmux_server_start == server_start
+        )
+
+        # Snapshot: resolution below reads displays as they were persisted.
+        old_displays = dict(self.window_display_names)
+
+        def _display_for(old_id: str) -> str:
+            ws = self.window_states.get(old_id)
+            return old_displays.get(old_id) or (ws.window_name if ws else "") or old_id
+
+        def _is_same_window(old_id: str, w: TmuxWindow) -> bool:
+            # Identity check for a persisted id that is live again: equal
+            # display name, or equal Terminal-N slot, means same terminal.
+            # Renames are ccbot-driven (allow-rename off) and mirrored into
+            # window_display_names, so an unexplained mismatch means the id
+            # was recycled by a tmux restart — re-resolve, don't trust it.
+            display = old_displays.get(old_id, "")
+            if not display or display == w.window_name:
+                return True
+            idx = slot_index(display)
+            if idx and w.window_index:
+                return idx == w.window_index
+            return False
+
+        def _survives(old_id: str) -> bool:
+            w = live_wins.get(old_id)
+            if w is None:
+                return False
+            return trust_live_ids or _is_same_window(old_id, w)
 
         changed = False
+        if server_start != self.tmux_server_start:
+            self.tmux_server_start = server_start
+            changed = True
 
-        # --- Migrate window_states ---
-        new_window_states: dict[str, WindowState] = {}
-        for key, ws in self.window_states.items():
-            if self._is_window_id(key):
-                if key in live_ids:
-                    new_window_states[key] = ws
+        # ---- Resolve every binding to its new value. ----
+        binding_items = sorted(
+            (uid, tid, val)
+            for uid, bindings in self.thread_bindings.items()
+            for tid, val in bindings.items()
+        )
+        claimed: set[str] = {
+            val
+            for _, _, val in binding_items
+            if self._is_window_id(val) and _survives(val)
+        }
+        rekey: dict[str, str] = {}  # old binding value -> new binding value
+
+        def _match_stale(display: str, remembered_cwd: str) -> TmuxWindow | None:
+            target = live_by_name.get(display)
+            if target is None:
+                idx = slot_index(display)
+                target = live_by_index.get(idx) if idx else None
+                if (
+                    target is not None
+                    and remembered_cwd
+                    and target.cwd
+                    and remembered_cwd != target.cwd
+                ):
+                    logger.info(
+                        "Slot %s cwd mismatch (%s != %s) — not reattaching '%s'",
+                        idx,
+                        target.cwd,
+                        remembered_cwd,
+                        display,
+                    )
+                    target = None
+            if target is not None and target.window_id in claimed:
+                logger.warning(
+                    "Window %s already claimed — not reattaching '%s' "
+                    "(1 topic = 1 window)",
+                    target.window_id,
+                    display,
+                )
+                target = None
+            return target
+
+        for _uid, _tid, val in binding_items:
+            if val in rekey:
+                continue
+            if self._is_window_id(val):
+                if _survives(val):
+                    continue
+                display = _display_for(val)
+                ws = self.window_states.get(val)
+                target = _match_stale(display, ws.cwd if ws else "")
+                if target is not None:
+                    rekey[val] = target.window_id
+                    claimed.add(target.window_id)
                 else:
-                    # Stale ID — try re-resolve by display name
-                    display = self.window_display_names.get(key, ws.window_name or key)
-                    new_id = live_by_name.get(display)
-                    if new_id:
-                        logger.info(
-                            "Re-resolved stale window_id %s -> %s (name=%s)",
-                            key,
-                            new_id,
-                            display,
-                        )
-                        new_window_states[new_id] = ws
-                        ws.window_name = display
-                        self.window_display_names[new_id] = display
-                        self.window_display_names.pop(key, None)
-                        changed = True
-                    else:
-                        logger.info(
-                            "Dropping stale window_state: %s (name=%s)", key, display
-                        )
-                        changed = True
+                    # PARK: rewrite the dead id to the display name (see
+                    # docstring). An id-shaped display (nothing was ever
+                    # recorded) gets an inert marker instead — it must
+                    # never collide with a recycled id.
+                    parked_val = (
+                        display if not self._is_window_id(display) else f"gone:{val}"
+                    )
+                    rekey[val] = parked_val
             else:
-                # Old format: key is window_name
-                new_id = live_by_name.get(key)
-                if new_id:
-                    logger.info("Migrating window_state key %s -> %s", key, new_id)
-                    ws.window_name = key
-                    new_window_states[new_id] = ws
-                    self.window_display_names[new_id] = key
-                    changed = True
+                # Parked (or ancient name-format) value: try to reattach by
+                # name, then by its own slot prefix.
+                ws = self.window_states.get(val)
+                target = _match_stale(val, ws.cwd if ws else "")
+                if target is not None:
+                    rekey[val] = target.window_id
+                    claimed.add(target.window_id)
+
+        # ---- Apply to thread_bindings (with 1-topic-1-window dedup). ----
+        seen_targets: dict[str, tuple[int, int]] = {}
+        new_bindings_by_user: dict[int, dict[int, str]] = {}
+        for uid, tid, val in binding_items:
+            new_val = rekey.get(val, val)
+            prior = seen_targets.get(new_val)
+            if prior is not None:
+                # A second binding resolving to the same window would
+                # double-post every reply. Keep the first; this topic stays
+                # in Telegram, unbound (never deleted).
+                changed = True
+                logger.warning(
+                    "Dropping duplicate binding user=%d thread=%d -> %s "
+                    "(already bound by user=%d thread=%d)",
+                    uid,
+                    tid,
+                    new_val,
+                    prior[0],
+                    prior[1],
+                )
+                continue
+            seen_targets[new_val] = (uid, tid)
+            new_bindings_by_user.setdefault(uid, {})[tid] = new_val
+            if new_val != val:
+                changed = True
+                if self._is_window_id(new_val):
+                    logger.info(
+                        "Re-resolved thread binding %s -> %s (user=%d, thread=%d)",
+                        val,
+                        new_val,
+                        uid,
+                        tid,
+                    )
                 else:
                     logger.info(
-                        "Dropping old-format window_state: %s (no live window)", key
+                        "Parked binding user=%d thread=%d: window %s gone, "
+                        "topic kept as '%s'",
+                        uid,
+                        tid,
+                        val,
+                        new_val,
                     )
-                    changed = True
+        self.thread_bindings = new_bindings_by_user
+        parked_vals = {v for v in seen_targets if not self._is_window_id(v)}
+
+        # ---- window_states follow the same resolution. ----
+        new_window_states: dict[str, WindowState] = {}
+        for key in sorted(self.window_states):
+            ws = self.window_states[key]
+            if self._is_window_id(key) and _survives(key):
+                new_window_states[key] = ws
+                continue
+            new_key = rekey.get(key)
+            if new_key is None and not self._is_window_id(key):
+                # State keyed by a parked/ancient name that no binding
+                # references this run: reattach by name (legacy migration)
+                # or keep it while a parked binding still uses the key.
+                target = live_by_name.get(key)
+                new_key = target.window_id if target else None
+                if new_key is None and key in parked_vals:
+                    new_window_states[key] = ws
+                    continue
+            if new_key is not None:
+                changed = True
+                if new_key in parked_vals:
+                    # Binding got parked — park its state under the same
+                    # name key so the cwd guard works at adoption time.
+                    ws.window_name = _display_for(key)
+                    new_window_states[new_key] = ws
+                elif new_key in self.window_states and _survives(new_key):
+                    pass  # the target window's own surviving state wins
+                else:
+                    ws.window_name = _display_for(key)
+                    new_window_states.setdefault(new_key, ws)
+                continue
+            changed = True
+            logger.info(
+                "Dropping stale window_state: %s (name=%s)", key, _display_for(key)
+            )
         self.window_states = new_window_states
 
-        # --- Migrate thread_bindings ---
-        for uid, bindings in self.thread_bindings.items():
-            new_bindings: dict[int, str] = {}
-            for tid, val in bindings.items():
-                if self._is_window_id(val):
-                    if val in live_ids:
-                        new_bindings[tid] = val
-                    else:
-                        display = self.window_display_names.get(val, val)
-                        new_id = live_by_name.get(display)
-                        if not new_id:
-                            # Name match failed (ai-title drifted) — fall back to
-                            # the stable Terminal-N number so the SAME topic is
-                            # reused across restarts instead of orphaned + a
-                            # duplicate created. This is what stops the churn.
-                            idx = _index_prefix(display)
-                            new_id = live_by_index.get(idx) if idx else None
-                        if new_id:
-                            logger.info(
-                                "Re-resolved thread binding %s -> %s (name=%s)",
-                                val,
-                                new_id,
-                                display,
-                            )
-                            new_bindings[tid] = new_id
-                            self.window_display_names[new_id] = display
-                            changed = True
-                        else:
-                            # No live window for this topic. KEEP the binding
-                            # (still pointing at the dead window_id) so the
-                            # mirror's _close_dead_topics deletes the Telegram
-                            # topic on its next tick. Dropping it here — the old
-                            # behaviour — orphaned the topic forever, which is
-                            # how hundreds of dead topics piled up.
-                            new_bindings[tid] = val
-                            logger.info(
-                                "Retaining dead thread binding for reconciler "
-                                "cleanup: user=%d, thread=%d, wid=%s",
-                                uid,
-                                tid,
-                                val,
-                            )
-                else:
-                    # Old format: val is window_name
-                    new_id = live_by_name.get(val)
-                    if new_id:
-                        logger.info("Migrating thread binding %s -> %s", val, new_id)
-                        new_bindings[tid] = new_id
-                        self.window_display_names[new_id] = val
-                        changed = True
-                    else:
-                        logger.info(
-                            "Dropping old-format thread binding: user=%d, thread=%d, name=%s",
-                            uid,
-                            tid,
-                            val,
-                        )
-                        changed = True
-            self.thread_bindings[uid] = new_bindings
-
-        # Remove empty user entries
-        empty_users = [uid for uid, b in self.thread_bindings.items() if not b]
-        for uid in empty_users:
-            del self.thread_bindings[uid]
-
-        # --- Migrate user_window_offsets ---
-        for uid, offsets in self.user_window_offsets.items():
+        # ---- user_window_offsets follow the same resolution. ----
+        for uid in sorted(self.user_window_offsets):
+            offsets = self.user_window_offsets[uid]
             new_offsets: dict[str, int] = {}
-            for key, offset in offsets.items():
-                if self._is_window_id(key):
-                    if key in live_ids:
-                        new_offsets[key] = offset
-                    else:
-                        display = self.window_display_names.get(key, key)
-                        new_id = live_by_name.get(display)
-                        if new_id:
-                            new_offsets[new_id] = offset
-                            changed = True
-                        else:
-                            changed = True
-                else:
-                    new_id = live_by_name.get(key)
-                    if new_id:
-                        new_offsets[new_id] = offset
-                        changed = True
-                    else:
-                        changed = True
+            for key in sorted(offsets):
+                off = offsets[key]
+                if self._is_window_id(key) and _survives(key):
+                    new_offsets[key] = off
+                    continue
+                new_key = rekey.get(key)
+                if new_key is None and not self._is_window_id(key):
+                    target = live_by_name.get(key)
+                    new_key = target.window_id if target else None
+                    if new_key is None and key in parked_vals:
+                        new_offsets[key] = off
+                        continue
+                if new_key is not None:
+                    new_offsets.setdefault(new_key, off)
+                changed = True
             self.user_window_offsets[uid] = new_offsets
+
+        # ---- window_display_names follow the same resolution. ----
+        new_displays: dict[str, str] = {}
+        for key, name in old_displays.items():
+            if self._is_window_id(key) and _survives(key):
+                new_displays[key] = name
+                continue
+            new_key = rekey.get(key)
+            if new_key is not None and self._is_window_id(new_key):
+                new_displays[new_key] = name
+            # Parked values need no display entry: get_display_name falls
+            # back to the value itself, which IS the topic name.
+            changed = changed or new_key != key
+        # A parked binding reattached by name/slot carries its topic name
+        # (the parked value itself) as the new window's display name.
+        for old_val, new_val in rekey.items():
+            if self._is_window_id(new_val) and not self._is_window_id(old_val):
+                new_displays.setdefault(new_val, old_val)
+        # Displays written by other code paths since the snapshot (none
+        # today, defensive) survive untouched.
+        for key, name in self.window_display_names.items():
+            if key not in old_displays:
+                new_displays.setdefault(key, name)
+        self.window_display_names = new_displays
+
+        # ---- Drain group_chat_ids ghosts: entries with no binding at all
+        # route nothing (the live graveyard measured 163 dead entries).
+        # Parked bindings keep theirs — their topics are alive.
+        valid_keys = {
+            f"{uid}:{tid}"
+            for uid, bindings in self.thread_bindings.items()
+            for tid in bindings
+        }
+        ghost_keys = [k for k in self.group_chat_ids if k not in valid_keys]
+        for k in ghost_keys:
+            del self.group_chat_ids[k]
+        if ghost_keys:
+            changed = True
+            logger.info("Pruned %d ghost group_chat_ids entries", len(ghost_keys))
 
         if changed:
             self._save_state()
@@ -404,6 +549,54 @@ class SessionManager:
         # Clean up session_map.json: stale window IDs and old-format keys
         await self._cleanup_stale_session_map_entries(live_ids)
         await self._cleanup_old_format_session_map_keys()
+
+    def adopt_parked_binding(self, window: TmuxWindow) -> tuple[int, int] | None:
+        """Re-point a parked binding at a live, unbound window in the same
+        Terminal-N slot — the reopened-terminal half of the topic-reuse
+        contract (resolve_stale_ids parks; this reattaches). Guards: slot
+        prefix must match, and when the parked side remembers a cwd it must
+        equal the window's — a different project in the same slot gets its
+        own fresh topic, never someone else's history and keystrokes.
+
+        Returns (user_id, thread_id) when a binding adopted the window.
+        """
+        if not window.window_index:
+            return None
+        for user_id, thread_id, val in sorted(self.iter_thread_bindings()):
+            if self._is_window_id(val):
+                continue  # live (or dying) binding — not parked
+            if slot_index(val) != window.window_index:
+                continue
+            ws = self.window_states.get(val)
+            if ws and ws.cwd and window.cwd and ws.cwd != window.cwd:
+                logger.info(
+                    "Not adopting window %s for parked '%s': cwd mismatch (%s != %s)",
+                    window.window_id,
+                    val,
+                    window.cwd,
+                    ws.cwd,
+                )
+                continue
+            self.thread_bindings[user_id][thread_id] = window.window_id
+            self.window_display_names[window.window_id] = val
+            state = self.window_states.pop(val, None)
+            if state is not None and window.window_id not in self.window_states:
+                state.window_name = val
+                self.window_states[window.window_id] = state
+            for offsets in self.user_window_offsets.values():
+                if val in offsets:
+                    offsets.setdefault(window.window_id, offsets[val])
+                    del offsets[val]
+            self._save_state()
+            logger.info(
+                "Adopted parked binding: thread %d -> window %s (slot %s, '%s')",
+                thread_id,
+                window.window_id,
+                window.window_index,
+                val,
+            )
+            return (user_id, thread_id)
+        return None
 
     async def _cleanup_old_format_session_map_keys(self) -> None:
         """Remove old-format keys (window_name instead of @window_id) from session_map.json."""
@@ -551,6 +744,17 @@ class SessionManager:
                 thread_id,
                 chat_id,
             )
+
+    def prune_group_routing(self, user_id: int, thread_id: int) -> None:
+        """Drop the group_chat_ids entry for a topic that no longer exists.
+
+        Called from clear_topic_state AFTER all cleanup that still needs
+        the routing entry (the supergroup message deletes) has run —
+        pruning it earlier made those deletes resolve to the positive user
+        id and silently fail, leaving stale inline buttons live.
+        """
+        if self.group_chat_ids.pop(f"{user_id}:{thread_id}", None) is not None:
+            self._save_state()
 
     def resolve_chat_id(self, user_id: int, thread_id: int | None = None) -> int:
         """Resolve the correct chat_id for sending messages.
@@ -888,9 +1092,11 @@ class SessionManager:
         window_id = bindings.pop(thread_id)
         if not bindings:
             del self.thread_bindings[user_id]
-        # Prune the routing map too, else it grows unbounded (every closed topic
-        # left a dead "user:thread" entry — that graveyard hit 160+ ghosts).
-        self.group_chat_ids.pop(f"{user_id}:{thread_id}", None)
+        # group_chat_ids is NOT pruned here: cleanup (clear_topic_state)
+        # still needs it to resolve the supergroup chat for message deletes,
+        # and an unbind with the topic still alive (e.g. "window gone,
+        # binding removed") must keep routing for that topic. The prune
+        # lives at the end of clear_topic_state; startup drains any ghosts.
         self._save_state()
         logger.info(
             "Unbound thread %d (was %s) for user %d",

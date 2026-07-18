@@ -266,3 +266,79 @@ class TestCloseDeadTopics:
 
         bot.delete_forum_topic.assert_not_called()
         assert mgr.get_window_for_thread(user_id, 42) == "@0"
+
+
+class TestParkedBindings:
+    """The data-loss guard (2026-07-17 review, finding #6): a binding whose
+    terminal vanished while ccbot was NOT watching gets parked at startup
+    (value = topic name, not a window id — see session.resolve_stale_ids).
+    The mirror must never delete a parked topic — a reboot with a partial
+    terminal reopen used to destroy every not-yet-reopened topic's full
+    history minutes after boot. A reopened same-slot terminal adopts the
+    parked topic instead of getting a duplicate."""
+
+    @pytest.mark.asyncio
+    async def test_never_deletes_parked_topics(self, monkeypatch, mgr, bot) -> None:
+        user_id = mirror._mirror_user_id()
+        mgr.set_group_chat_id(user_id, 42, config.mirror_chat_id)
+        mgr.thread_bindings[user_id] = {42: "2 — kolab"}  # parked value
+        monkeypatch.setattr(
+            mirror.tmux_manager, "list_windows", AsyncMock(return_value=[])
+        )
+        cleanup_mock = AsyncMock()
+        monkeypatch.setattr(mirror, "clear_topic_state", cleanup_mock)
+
+        await mirror.mirror_tick(bot)
+
+        bot.delete_forum_topic.assert_not_called()
+        cleanup_mock.assert_not_called()
+        assert mgr.get_window_for_thread(user_id, 42) == "2 — kolab"
+
+    @pytest.mark.asyncio
+    async def test_reopened_slot_adopts_parked_topic(
+        self, monkeypatch, mgr, bot
+    ) -> None:
+        user_id = mirror._mirror_user_id()
+        mgr.set_group_chat_id(user_id, 42, config.mirror_chat_id)
+        mgr.thread_bindings[user_id] = {42: "2 — kolab"}
+        monkeypatch.setattr(
+            mirror.tmux_manager,
+            "list_windows",
+            AsyncMock(
+                return_value=[
+                    _window(window_id="@5", window_name="zsh", window_index="2")
+                ]
+            ),
+        )
+
+        await mirror.mirror_tick(bot)
+
+        # Adopted, not duplicated: no new topic, binding re-pointed.
+        bot.create_forum_topic.assert_not_called()
+        bot.delete_forum_topic.assert_not_called()
+        assert mgr.get_window_for_thread(user_id, 42) == "@5"
+        assert mgr.get_display_name("@5") == "2 — kolab"
+
+    @pytest.mark.asyncio
+    async def test_wrong_slot_gets_fresh_topic_parked_stays(
+        self, monkeypatch, mgr, bot
+    ) -> None:
+        user_id = mirror._mirror_user_id()
+        mgr.set_group_chat_id(user_id, 42, config.mirror_chat_id)
+        mgr.thread_bindings[user_id] = {42: "2 — kolab"}
+        monkeypatch.setattr(
+            mirror.tmux_manager,
+            "list_windows",
+            AsyncMock(
+                return_value=[
+                    _window(window_id="@5", window_name="zsh", window_index="4")
+                ]
+            ),
+        )
+
+        await mirror.mirror_tick(bot)
+
+        # Slot 4 ≠ parked slot 2: new topic for the window, parked untouched.
+        bot.create_forum_topic.assert_called_once()
+        bot.delete_forum_topic.assert_not_called()
+        assert mgr.get_window_for_thread(user_id, 42) == "2 — kolab"

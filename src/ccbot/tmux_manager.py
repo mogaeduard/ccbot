@@ -182,6 +182,30 @@ class TmuxManager:
                 argv += ["-S", self._server.socket_path]
         return argv + list(args)
 
+    async def get_server_start_time(self) -> str:
+        """The tmux server's start_time, or "" when no server is running.
+
+        Window ids are never recycled while one server lives — they only
+        reset (and start colliding with persisted ids) across a server
+        restart. Persisting this value lets startup re-resolution know
+        whether persisted ids can be trusted verbatim (same server) or
+        must pass identity checks (new server).
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *self._tmux_argv("list-sessions", "-F", "#{start_time}"),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await proc.communicate()
+            if proc.returncode != 0:
+                return ""
+            lines = stdout.decode("utf-8", "replace").split()
+            return lines[0] if lines else ""
+        except Exception as e:
+            logger.debug("Failed to read tmux server start_time: %s", e)
+            return ""
+
     async def list_windows(self) -> list[TmuxWindow]:
         """List all windows in the session with their working directories.
 

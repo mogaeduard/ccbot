@@ -308,7 +308,13 @@ class TestSpeakCommandFlow:
     async def test_speed_argument_is_parsed_clamped_and_sent(self) -> None:
         update = _make_speak_update()
         messages = [_m("assistant", "text", "Short answer.")]
-        for raw, expected in (("0.8", 0.8), ("1.5x", 1.5), ("0,7", 0.7), ("9", 2.0), ("0.1", 0.5)):
+        for raw, expected in (
+            ("0.8", 0.8),
+            ("1.5x", 1.5),
+            ("0,7", 0.7),
+            ("9", 2.0),
+            ("0.1", 0.5),
+        ):
             with (
                 patch("ccbot.bot.is_user_allowed", return_value=True),
                 patch("ccbot.bot._get_thread_id", return_value=42),
@@ -327,14 +333,16 @@ class TestSpeakCommandFlow:
             assert mock_post.call_args.kwargs["json"]["speed"] == expected, raw
 
     @pytest.mark.asyncio
-    async def test_invalid_speed_argument_replies_usage_and_skips_tts(self) -> None:
+    async def test_non_numeric_argument_is_ignored_and_speaks(self) -> None:
+        """Pre-speed-feature behavior: any argument was ignored — '/speak now'
+        must produce audio at default speed, not a usage lecture."""
         update = _make_speak_update()
         messages = [_m("assistant", "text", "Short answer.")]
         with (
             patch("ccbot.bot.is_user_allowed", return_value=True),
             patch("ccbot.bot._get_thread_id", return_value=42),
             patch("ccbot.bot.session_manager") as mock_sm,
-            patch("ccbot.bot.safe_reply", new_callable=AsyncMock) as mock_reply,
+            patch("ccbot.bot.safe_reply", new_callable=AsyncMock),
             patch.object(
                 httpx.AsyncClient,
                 "post",
@@ -344,10 +352,10 @@ class TestSpeakCommandFlow:
         ):
             mock_sm.get_window_for_thread.return_value = "@1"
             mock_sm.get_recent_messages = AsyncMock(return_value=(messages, None))
-            await bot.speak_command(update, _make_context(["fast"]))
+            await bot.speak_command(update, _make_context(["now"]))
 
-        mock_post.assert_not_called()
-        assert "Usage" in mock_reply.call_args.args[1]
+        mock_post.assert_called_once()
+        assert "speed" not in mock_post.call_args.kwargs["json"]
 
     @pytest.mark.asyncio
     async def test_long_answer_uses_cli_summary(self) -> None:

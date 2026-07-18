@@ -11,6 +11,7 @@ from typing import Any
 
 from telegram import Bot
 
+from ..session import session_manager
 from .interactive_ui import clear_interactive_msg
 from .message_queue import (
     clear_status_msg_info,
@@ -55,3 +56,9 @@ async def clear_topic_state(
         if user_data.get("_pending_thread_id") == thread_id:
             user_data.pop("_pending_thread_id", None)
             user_data.pop("_pending_thread_text", None)
+
+    # LAST: drop the topic's group routing entry. Everything above that
+    # deletes Telegram messages resolves the supergroup chat through it —
+    # pruning earlier (it used to live in unbind_thread) made those deletes
+    # target the positive user id and silently fail.
+    session_manager.prune_group_routing(user_id, thread_id)

@@ -34,6 +34,7 @@ from .config import config
 from .handlers.cleanup import clear_topic_state
 from .session import session_manager
 from .tmux_manager import tmux_manager
+from .topic_titles import build_topic_name
 
 logger = logging.getLogger(__name__)
 
@@ -53,13 +54,26 @@ async def _create_topics(bot: Bot, mirror_chat_id: int) -> None:
         if w.window_id in bound_window_ids:
             continue
 
+        # A parked binding for this Terminal-N slot (its terminal vanished
+        # while ccbot wasn't watching — see session.resolve_stale_ids)
+        # adopts the reopened window: same topic, full history, no
+        # duplicate. Slot and remembered-cwd guards live in the adopter.
+        adopted = session_manager.adopt_parked_binding(w)
+        if adopted is not None:
+            logger.info(
+                "Mirror: parked topic (thread=%d) adopted window %s",
+                adopted[1],
+                w.window_id,
+            )
+            continue
+
         # Every window gets a topic — including plain shells with no Claude
         # session yet, so each numbered terminal has a standing chat you can
         # type cc/cc-new/cc-resume into (Termius-style). Number-first naming
         # keeps topics identifiable as Terminal N.
         name = w.window_name or (Path(w.cwd).name if w.cwd else "") or w.window_id
         if w.window_index:
-            name = f"{w.window_index} — {name}"
+            name = build_topic_name(w.window_index, name)
         try:
             topic = await bot.create_forum_topic(chat_id=mirror_chat_id, name=name)
         except TelegramError as e:
@@ -94,6 +108,12 @@ async def _close_dead_topics(bot: Bot, mirror_chat_id: int) -> None:
 
     for user_id, thread_id, window_id in list(session_manager.iter_thread_bindings()):
         if window_id in live_ids:
+            continue
+        if not window_id.startswith("@"):
+            # Parked binding (value is a topic name, not a window id — see
+            # session.resolve_stale_ids): its terminal vanished while ccbot
+            # wasn't watching, NOT on our watch. Never delete its topic —
+            # that history is irreplaceable; adoption may still revive it.
             continue
 
         # Delete (not close) the topic: a closetab'd/X-closed terminal should

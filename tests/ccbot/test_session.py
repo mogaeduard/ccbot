@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 import ccbot.session as session_module
-from ccbot.session import SessionManager
+from ccbot.session import SessionManager, WindowState
 from ccbot.tmux_manager import TmuxWindow
 
 
@@ -369,11 +369,21 @@ class TestResolveStaleIds:
     unmatched binding is retained so the mirror's dead-topic reconciler
     deletes it rather than the binding being dropped and the topic stranded."""
 
-    def _live(self, monkeypatch, windows: list[TmuxWindow]) -> None:
+    def _live(
+        self,
+        monkeypatch,
+        windows: list[TmuxWindow],
+        server_start: str = "srv-1",
+    ) -> None:
         monkeypatch.setattr(
             session_module.tmux_manager,
             "list_windows",
             AsyncMock(return_value=windows),
+        )
+        monkeypatch.setattr(
+            session_module.tmux_manager,
+            "get_server_start_time",
+            AsyncMock(return_value=server_start),
         )
 
     @pytest.mark.asyncio
@@ -392,7 +402,7 @@ class TestResolveStaleIds:
         assert mgr.get_window_for_thread(100, 10) == "@9"
 
     @pytest.mark.asyncio
-    async def test_retains_binding_when_no_live_window(
+    async def test_parks_binding_when_no_live_window(
         self, mgr: SessionManager, monkeypatch
     ) -> None:
         mgr.bind_thread(100, 20, "@2", window_name="2 — foo")
@@ -402,14 +412,144 @@ class TestResolveStaleIds:
             [TmuxWindow("@9", "1 — bar", "/x", window_index="1")],
         )
         await mgr.resolve_stale_ids()
-        # Retained (still points at dead @2) so _close_dead_topics deletes the
-        # topic on its next tick — the old code dropped it and orphaned it.
+        # PARKED: the value becomes the topic name (never a dead id, which
+        # fed the mirror's dead-topic deletion and destroyed real topic
+        # history; never droppable, which orphaned the topic forever).
+        assert mgr.get_window_for_thread(100, 20) == "2 — foo"
+
+    @pytest.mark.asyncio
+    async def test_parked_binding_reattaches_by_slot_on_later_restart(
+        self, mgr: SessionManager, monkeypatch
+    ) -> None:
+        mgr.bind_thread(100, 20, "2 — foo", window_name="")
+        self._live(
+            monkeypatch,
+            [TmuxWindow("@4", "zsh", "/x", window_index="2")],
+        )
+        await mgr.resolve_stale_ids()
+        assert mgr.get_window_for_thread(100, 20) == "@4"
+        assert mgr.get_display_name("@4") == "2 — foo"
+
+    @pytest.mark.asyncio
+    async def test_slot_fallback_rejected_on_cwd_mismatch(
+        self, mgr: SessionManager, monkeypatch
+    ) -> None:
+        """A different project reopened in the same slot must NOT inherit
+        the topic — that misroutes the user's keystrokes into it."""
+        mgr.bind_thread(100, 20, "@2", window_name="2 — kolab")
+        mgr.window_states["@2"] = WindowState(session_id="s", cwd="/home/kolab")
+        self._live(
+            monkeypatch,
+            [TmuxWindow("@4", "zsh", "/home/eterni", window_index="2")],
+        )
+        await mgr.resolve_stale_ids()
+        assert mgr.get_window_for_thread(100, 20) == "2 — kolab"  # parked
+
+    @pytest.mark.asyncio
+    async def test_slot_fallback_never_claims_a_window_twice(
+        self, mgr: SessionManager, monkeypatch
+    ) -> None:
+        """1 topic = 1 window: two bindings must not resolve to one window."""
+        mgr.bind_thread(100, 20, "@2", window_name="1 — foo")
+        mgr.bind_thread(100, 30, "@3", window_name="1 — bar")
+        self._live(
+            monkeypatch,
+            [TmuxWindow("@7", "zsh", "/x", window_index="1")],
+        )
+        await mgr.resolve_stale_ids()
+        bound = [wid for _, _, wid in mgr.iter_thread_bindings() if wid == "@7"]
+        assert len(bound) == 1
+
+    @pytest.mark.asyncio
+    async def test_recycled_window_id_is_not_trusted_after_server_restart(
+        self, mgr: SessionManager, monkeypatch
+    ) -> None:
+        """tmux restarts recycle ids from @0: a live @2 belonging to a
+        DIFFERENT terminal must not keep the old binding — the topic's
+        keystrokes would land in an unrelated session."""
+        mgr.tmux_server_start = "srv-old"  # state saved under a dead server
+        mgr.bind_thread(100, 20, "@2", window_name="2 — kolab")
+        # @2 exists but is now slot 5 named differently; slot 2 is @6.
+        self._live(
+            monkeypatch,
+            [
+                TmuxWindow("@2", "5 — eterni", "/e", window_index="5"),
+                TmuxWindow("@6", "zsh", "/k", window_index="2"),
+            ],
+            server_start="srv-new",
+        )
+        await mgr.resolve_stale_ids()
+        assert mgr.get_window_for_thread(100, 20) == "@6"
+        assert mgr.tmux_server_start == "srv-new"
+
+    @pytest.mark.asyncio
+    async def test_live_id_trusted_on_same_server_despite_display_drift(
+        self, mgr: SessionManager, monkeypatch
+    ) -> None:
+        """Ids are never recycled while one tmux server lives: same
+        start_time → a live id keeps its binding even when the recorded
+        display name is garbage (real drifted state observed live)."""
+        mgr.tmux_server_start = "srv-1"
+        mgr.bind_thread(100, 20, "@2", window_name="2_1_214")  # junk display
+        self._live(
+            monkeypatch,
+            [TmuxWindow("@2", "2 — MacBook freezing issues", "/x", window_index="2")],
+            server_start="srv-1",
+        )
+        await mgr.resolve_stale_ids()
         assert mgr.get_window_for_thread(100, 20) == "@2"
 
     @pytest.mark.asyncio
-    async def test_live_binding_kept(
+    async def test_purely_numeric_window_name_is_not_a_slot(
         self, mgr: SessionManager, monkeypatch
     ) -> None:
+        """A window literally named "3" has no Terminal-N prefix; it must
+        never index-match an arbitrary terminal after a restart."""
+        mgr.bind_thread(100, 20, "@2", window_name="3")
+        self._live(
+            monkeypatch,
+            [TmuxWindow("@7", "zsh", "/x", window_index="3")],
+        )
+        await mgr.resolve_stale_ids()
+        assert mgr.get_window_for_thread(100, 20) == "3"  # parked, not @7
+
+    @pytest.mark.asyncio
+    async def test_slot_rematch_carries_states_and_offsets(
+        self, mgr: SessionManager, monkeypatch
+    ) -> None:
+        """window_states and read offsets must follow the SAME re-mapping as
+        the binding — diverging silently unroutes the terminal's output and
+        re-ingests its whole transcript."""
+        mgr.bind_thread(100, 10, "@1", window_name="1 — old title")
+        mgr.window_states["@1"] = WindowState(session_id="sess-1", cwd="/x")
+        mgr.user_window_offsets[100] = {"@1": 12345}
+        self._live(
+            monkeypatch,
+            [TmuxWindow("@9", "1 — new title", "/x", window_index="1")],
+        )
+        await mgr.resolve_stale_ids()
+        assert mgr.get_window_for_thread(100, 10) == "@9"
+        assert mgr.window_states["@9"].session_id == "sess-1"
+        assert mgr.user_window_offsets[100]["@9"] == 12345
+        assert "@1" not in mgr.window_states
+
+    @pytest.mark.asyncio
+    async def test_ghost_group_chat_ids_drained(
+        self, mgr: SessionManager, monkeypatch
+    ) -> None:
+        mgr.bind_thread(100, 10, "@1", window_name="1 — live")
+        mgr.group_chat_ids["100:10"] = -100999  # live topic — kept
+        mgr.group_chat_ids["100:777"] = -100999  # no binding — ghost
+        self._live(
+            monkeypatch,
+            [TmuxWindow("@1", "1 — live", "/x", window_index="1")],
+        )
+        await mgr.resolve_stale_ids()
+        assert "100:10" in mgr.group_chat_ids
+        assert "100:777" not in mgr.group_chat_ids
+
+    @pytest.mark.asyncio
+    async def test_live_binding_kept(self, mgr: SessionManager, monkeypatch) -> None:
         mgr.bind_thread(100, 30, "@5", window_name="3 — baz")
         self._live(
             monkeypatch,
