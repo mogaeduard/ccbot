@@ -557,3 +557,61 @@ class TestResolveStaleIds:
         )
         await mgr.resolve_stale_ids()
         assert mgr.get_window_for_thread(100, 30) == "@5"
+
+    @pytest.mark.asyncio
+    async def test_no_identity_evidence_parks_after_server_restart(
+        self, mgr: SessionManager, monkeypatch
+    ) -> None:
+        """After a REAL server restart ids are recycled: a live id with NO
+        recorded display/name evidence must fail closed — park the binding,
+        never route the topic's keystrokes into a stranger's terminal."""
+        mgr.tmux_server_start = "srv-old"
+        mgr.bind_thread(100, 20, "@2", window_name="")
+        self._live(
+            monkeypatch,
+            [TmuxWindow("@2", "eterni", "/e", window_index="5")],
+            server_start="srv-new",
+        )
+        await mgr.resolve_stale_ids()
+        # Display fallback is the id itself (id-shaped) → inert marker.
+        assert mgr.get_window_for_thread(100, 20) == "gone:@2"
+
+    @pytest.mark.asyncio
+    async def test_two_topics_parked_to_same_name_both_kept(
+        self, mgr: SessionManager, monkeypatch
+    ) -> None:
+        """Parked values are names, not windows: the 1-topic-1-window dedup
+        must not drop the second topic parking to an identical name — that
+        would erase its parked identity (and drain its group routing)."""
+        mgr.bind_thread(100, 20, "@2", window_name="2 — foo")
+        mgr.bind_thread(100, 30, "@3", window_name="2 — foo")
+        self._live(monkeypatch, [])
+        await mgr.resolve_stale_ids()
+        assert mgr.get_window_for_thread(100, 20) == "2 — foo"
+        assert mgr.get_window_for_thread(100, 30) == "2 — foo"
+
+
+class TestAdoptParkedBinding:
+    """Direct adoption-guard coverage (the mirror flow is in test_mirror)."""
+
+    def test_exact_name_match_adopts_slotless_parked_value(
+        self, mgr: SessionManager
+    ) -> None:
+        """Parked values without a 'N — ' slot prefix (ancient name-format
+        bindings) must still adopt a reopened window with exactly that
+        name — slot-only matching left them parked forever."""
+        mgr.bind_thread(100, 20, "myproject", window_name="")
+        got = mgr.adopt_parked_binding(
+            TmuxWindow("@5", "myproject", "/x", window_index="7")
+        )
+        assert got == (100, 20)
+        assert mgr.get_window_for_thread(100, 20) == "@5"
+
+    def test_empty_name_and_index_never_match(self, mgr: SessionManager) -> None:
+        """No evidence, no adoption: a window with neither index nor name
+        must not vacuum up a parked binding."""
+        mgr.bind_thread(100, 20, "myproject", window_name="")
+        assert (
+            mgr.adopt_parked_binding(TmuxWindow("@5", "", "/x", window_index=""))
+            is None
+        )

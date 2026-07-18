@@ -170,6 +170,63 @@ class TestListWindowsSkipsPlaceholder:
             assert mock_exec.call_count == 2
 
 
+class TestListWindowsLastGoodFallback:
+    """A failed listing must serve the last good result, never [] —
+    consumers treat [] as "every window is gone" and the mirror would
+    delete every Telegram topic for that (2026-07-18 review)."""
+
+    @staticmethod
+    def _failing_proc():
+        proc = MagicMock()
+        proc.returncode = 1
+        proc.communicate = AsyncMock(return_value=(b"", b"no server running"))
+        return patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc))
+
+    async def _prime(self, tm: TmuxManager) -> None:
+        line = TestListWindowsSkipsPlaceholder._pane_line("@1", "proj", "1")
+        with TestListWindowsSkipsPlaceholder._patch_tmux_output([line]):
+            got = await tm.list_windows()
+        assert [w.window_id for w in got] == ["@1"]
+        tm._invalidate_windows_cache()
+
+    @pytest.mark.asyncio
+    async def test_nonzero_exit_serves_last_good(self) -> None:
+        tm = TmuxManager(session_name="ccbot")
+        await self._prime(tm)
+        with self._failing_proc():
+            degraded = await tm.list_windows()
+        assert [w.window_id for w in degraded] == ["@1"]
+
+    @pytest.mark.asyncio
+    async def test_exception_serves_last_good(self) -> None:
+        tm = TmuxManager(session_name="ccbot")
+        await self._prime(tm)
+        with patch(
+            "asyncio.create_subprocess_exec",
+            AsyncMock(side_effect=OSError("fork failed")),
+        ):
+            degraded = await tm.list_windows()
+        assert [w.window_id for w in degraded] == ["@1"]
+
+    @pytest.mark.asyncio
+    async def test_failure_before_any_success_returns_empty(self) -> None:
+        """No last-good yet → [] is genuinely 'no information'."""
+        tm = TmuxManager(session_name="ccbot")
+        with self._failing_proc():
+            assert await tm.list_windows() == []
+
+    @pytest.mark.asyncio
+    async def test_failure_is_not_cached(self) -> None:
+        """The degraded result must not enter the TTL cache: the next call
+        retries tmux for real instead of serving stale-as-fresh."""
+        tm = TmuxManager(session_name="ccbot")
+        await self._prime(tm)
+        with self._failing_proc() as mock_exec:
+            await tm.list_windows()
+            await tm.list_windows()
+            assert mock_exec.call_count == 2
+
+
 TMUX_SOCKET = "batchtest"
 
 

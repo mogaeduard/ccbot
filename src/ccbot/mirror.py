@@ -105,15 +105,26 @@ async def _close_dead_topics(bot: Bot, mirror_chat_id: int) -> None:
     the tmux-windows-set and bound-topics-set must stay identical.
     """
     live_ids = {w.window_id for w in await tmux_manager.list_windows()}
+    if not live_ids:
+        # Zero live windows would delete EVERY topic — an irreversible mass
+        # action we never take on a single observation: an empty list is far
+        # more likely a failed/degraded listing (tmux hiccup before any
+        # last-good snapshot exists) than the user closing all terminals at
+        # once. ponytail: if truly all terminals closed, topics linger until
+        # the next window opens; acceptable vs. unrecoverable history loss.
+        return
 
     for user_id, thread_id, window_id in list(session_manager.iter_thread_bindings()):
         if window_id in live_ids:
             continue
-        if not window_id.startswith("@"):
+        if not session_manager._is_window_id(window_id):
             # Parked binding (value is a topic name, not a window id — see
             # session.resolve_stale_ids): its terminal vanished while ccbot
             # wasn't watching, NOT on our watch. Never delete its topic —
             # that history is irreplaceable; adoption may still revive it.
+            # Must be the same id-shape predicate parking used: a topic
+            # literally named "@project" parks as "@project" and a bare
+            # startswith("@") test would have fed it to deletion.
             continue
 
         # Delete (not close) the topic: a closetab'd/X-closed terminal should

@@ -179,8 +179,12 @@ class TestCloseDeadTopics:
         user_id = mirror._mirror_user_id()
         mgr.set_group_chat_id(user_id, 42, config.mirror_chat_id)
         mgr.bind_thread(user_id, 42, "@0", window_name="proj")
+        # The OTHER live window proves the listing is genuine — an all-empty
+        # listing is treated as degraded and deletes nothing (see below).
         monkeypatch.setattr(
-            mirror.tmux_manager, "list_windows", AsyncMock(return_value=[])
+            mirror.tmux_manager,
+            "list_windows",
+            AsyncMock(return_value=[_window(window_id="@9", window_name="other")]),
         )
         cleanup_mock = AsyncMock()
         monkeypatch.setattr(mirror, "clear_topic_state", cleanup_mock)
@@ -236,7 +240,9 @@ class TestCloseDeadTopics:
         """
         mgr.bind_thread(100, 7, "@0", window_name="proj")  # no set_group_chat_id
         monkeypatch.setattr(
-            mirror.tmux_manager, "list_windows", AsyncMock(return_value=[])
+            mirror.tmux_manager,
+            "list_windows",
+            AsyncMock(return_value=[_window(window_id="@9", window_name="other")]),
         )
         cleanup_mock = AsyncMock()
         monkeypatch.setattr(mirror, "clear_topic_state", cleanup_mock)
@@ -263,6 +269,25 @@ class TestCloseDeadTopics:
         )
 
         await mirror.mirror_tick(bot)
+
+        bot.delete_forum_topic.assert_not_called()
+        assert mgr.get_window_for_thread(user_id, 42) == "@0"
+
+    @pytest.mark.asyncio
+    async def test_empty_live_listing_deletes_nothing(
+        self, monkeypatch, mgr, bot
+    ) -> None:
+        """Zero live windows would delete EVERY topic — treated as a
+        degraded/failed listing (tmux hiccup before any last-good snapshot
+        exists), never acted on: topic deletion is irreversible."""
+        user_id = mirror._mirror_user_id()
+        mgr.set_group_chat_id(user_id, 42, config.mirror_chat_id)
+        mgr.bind_thread(user_id, 42, "@0", window_name="proj")
+        monkeypatch.setattr(
+            mirror.tmux_manager, "list_windows", AsyncMock(return_value=[])
+        )
+
+        await mirror._close_dead_topics(bot, config.mirror_chat_id)
 
         bot.delete_forum_topic.assert_not_called()
         assert mgr.get_window_for_thread(user_id, 42) == "@0"

@@ -75,6 +75,11 @@ class TmuxManager:
         self.session_name = session_name or config.tmux_session_name
         self._server: libtmux.Server | None = None
         self._windows_cache: tuple[float, list[TmuxWindow]] | None = None
+        # Last successful listing, no TTL. Served when the tmux subprocess
+        # fails transiently (fork under memory pressure, ...): consumers
+        # like the mirror's dead-topic cleanup must never mistake "could
+        # not list" for "all windows are gone" — that deletes every topic.
+        self._windows_last_good: list[TmuxWindow] | None = None
 
     @property
     def server(self) -> libtmux.Server:
@@ -170,6 +175,23 @@ class TmuxManager:
         next list_windows() reflects the create/kill/rename immediately."""
         self._windows_cache = None
 
+    def _degraded_windows(self) -> list[TmuxWindow]:
+        """Fallback for a failed listing: the last good result, or [].
+
+        Consumers treat [] as "every window is gone" (the mirror deletes
+        the topic of every window it can't see), so a transient failure
+        must degrade to stale data, not to an empty world. Before the
+        first successful listing there is nothing to serve — [] is then
+        genuinely "no windows yet".
+        """
+        if self._windows_last_good is not None:
+            logger.warning(
+                "list_windows failed; serving last good result (%d windows)",
+                len(self._windows_last_good),
+            )
+            return self._windows_last_good
+        return []
+
     def _tmux_argv(self, *args: str) -> list[str]:
         """Build a tmux CLI invocation aimed at the same server libtmux
         talks to — tests inject a Server on a private socket; production
@@ -210,8 +232,11 @@ class TmuxManager:
         """List all windows in the session with their working directories.
 
         One `tmux list-panes -s` call for the whole session, cached for
-        _WINDOWS_CACHE_TTL (see the constant's comment for why). Failures
-        are not cached.
+        _WINDOWS_CACHE_TTL (see the constant's comment for why). A failed
+        listing is never cached — and never returned as [] when a previous
+        listing succeeded: it serves the last good result instead, so a
+        transient subprocess failure can't masquerade as "every window is
+        gone" (the mirror would delete every topic for that).
 
         Returns:
             List of TmuxWindow with window info and cwd
@@ -236,10 +261,10 @@ class TmuxManager:
                 # Session doesn't exist (yet) — same as the old
                 # get_session() → None path.
                 logger.debug("list-panes failed: %s", stderr.decode("utf-8", "replace"))
-                return []
+                return self._degraded_windows()
         except Exception as e:
             logger.error(f"Failed to list windows: {e}")
-            return []
+            return self._degraded_windows()
 
         for line in stdout.decode("utf-8", "replace").splitlines():
             parts = line.split(_LIST_SEP)
@@ -267,6 +292,7 @@ class TmuxManager:
             )
 
         self._windows_cache = (now, windows)
+        self._windows_last_good = windows
         return windows
 
     async def find_window_by_name(self, window_name: str) -> TmuxWindow | None:

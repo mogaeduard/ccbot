@@ -305,13 +305,20 @@ class SessionManager:
             return old_displays.get(old_id) or (ws.window_name if ws else "") or old_id
 
         def _is_same_window(old_id: str, w: TmuxWindow) -> bool:
-            # Identity check for a persisted id that is live again: equal
-            # display name, or equal Terminal-N slot, means same terminal.
-            # Renames are ccbot-driven (allow-rename off) and mirrored into
-            # window_display_names, so an unexplained mismatch means the id
-            # was recycled by a tmux restart — re-resolve, don't trust it.
-            display = old_displays.get(old_id, "")
-            if not display or display == w.window_name:
+            # Identity check for a persisted id that is live again AFTER a
+            # real server restart (the trusted same-server tier never gets
+            # here): equal display name, or equal Terminal-N slot, means
+            # same terminal. Renames are ccbot-driven (allow-rename off)
+            # and mirrored into window_display_names, so an unexplained
+            # mismatch means the id was recycled — re-resolve, don't trust
+            # it. No recorded evidence at all also fails closed: a recycled
+            # id with an unprovable identity parks (topic kept) instead of
+            # binding the topic to a stranger's terminal.
+            ws = self.window_states.get(old_id)
+            display = old_displays.get(old_id) or (ws.window_name if ws else "")
+            if not display:
+                return False
+            if display == w.window_name:
                 return True
             idx = slot_index(display)
             if idx and w.window_index:
@@ -407,10 +414,13 @@ class SessionManager:
         for uid, tid, val in binding_items:
             new_val = rekey.get(val, val)
             prior = seen_targets.get(new_val)
-            if prior is not None:
-                # A second binding resolving to the same window would
+            if prior is not None and self._is_window_id(new_val):
+                # A second binding resolving to the same live WINDOW would
                 # double-post every reply. Keep the first; this topic stays
-                # in Telegram, unbound (never deleted).
+                # in Telegram, unbound (never deleted). Parked values are
+                # names, not windows — two topics parking to the same name
+                # both keep their binding (dropping one would erase its
+                # parked identity for no 1-topic-1-window gain).
                 changed = True
                 logger.warning(
                     "Dropping duplicate binding user=%d thread=%d -> %s "
@@ -422,7 +432,7 @@ class SessionManager:
                     prior[1],
                 )
                 continue
-            seen_targets[new_val] = (uid, tid)
+            seen_targets.setdefault(new_val, (uid, tid))
             new_bindings_by_user.setdefault(uid, {})[tid] = new_val
             if new_val != val:
                 changed = True
@@ -560,12 +570,17 @@ class SessionManager:
 
         Returns (user_id, thread_id) when a binding adopted the window.
         """
-        if not window.window_index:
-            return None
         for user_id, thread_id, val in sorted(self.iter_thread_bindings()):
             if self._is_window_id(val):
                 continue  # live (or dying) binding — not parked
-            if slot_index(val) != window.window_index:
+            # Slot match for "N — name" topics; exact-name match covers
+            # parked values with no slot prefix (ancient name-format
+            # bindings). Both require real evidence — empty never matches.
+            slot_ok = bool(window.window_index) and (
+                slot_index(val) == window.window_index
+            )
+            name_ok = bool(window.window_name) and val == window.window_name
+            if not (slot_ok or name_ok):
                 continue
             ws = self.window_states.get(val)
             if ws and ws.cwd and window.cwd and ws.cwd != window.cwd:
@@ -862,8 +877,15 @@ class SessionManager:
                     self.window_display_names[window_id] = new_wname
                     changed = True
 
-        # Clean up window_states entries not in current session_map.
-        stale_wids = [w for w in self.window_states if w and w not in valid_wids]
+        # Clean up window_states entries not in current session_map — but
+        # never the name-keyed states of PARKED bindings (they carry the
+        # remembered cwd that gates adoption; sweeping them let a different
+        # project reopened in the same slot inherit the topic).
+        stale_wids = [
+            w
+            for w in self.window_states
+            if w and self._is_window_id(w) and w not in valid_wids
+        ]
         for wid in stale_wids:
             logger.info("Removing stale window_state: %s", wid)
             del self.window_states[wid]
