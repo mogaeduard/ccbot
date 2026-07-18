@@ -22,11 +22,11 @@ import contextlib
 import shutil
 import time
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from ccbot.tmux_manager import TmuxManager
+from ccbot.tmux_manager import _LIST_SEP, TmuxManager
 
 
 class TestSendKeysLiteralBranch:
@@ -109,38 +109,65 @@ class TestListWindowsSkipsPlaceholder:
     external renamed the window away from "__main__")."""
 
     @staticmethod
-    def _mock_window(window_id: str, name: str, index: str) -> MagicMock:
-        w = MagicMock()
-        w.window_id = window_id
-        w.window_name = name
-        w.window_index = index
-        w.active_pane.pane_current_path = "/tmp"
-        w.active_pane.pane_current_command = "zsh"
-        return w
+    def _pane_line(window_id: str, name: str, index: str, active: str = "1") -> str:
+        return _LIST_SEP.join((window_id, name, index, active, "/tmp", "zsh"))
+
+    @staticmethod
+    def _patch_tmux_output(lines: list[str]):
+        proc = MagicMock()
+        proc.returncode = 0
+        proc.communicate = AsyncMock(
+            return_value=(("\n".join(lines) + "\n").encode(), b"")
+        )
+        return patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc))
 
     @pytest.mark.asyncio
     async def test_skips_by_name(self) -> None:
         tm = TmuxManager(session_name="ccbot")
-        mock_session = MagicMock()
-        mock_session.windows = [
-            self._mock_window("@0", "__main__", "0"),
-            self._mock_window("@1", "proj", "1"),
-        ]
-        with patch.object(tm, "get_session", return_value=mock_session):
+        with self._patch_tmux_output(
+            [
+                self._pane_line("@0", "__main__", "0"),
+                self._pane_line("@1", "proj", "1"),
+            ]
+        ):
             windows = await tm.list_windows()
         assert [w.window_name for w in windows] == ["proj"]
 
     @pytest.mark.asyncio
     async def test_skips_by_index_even_if_renamed(self) -> None:
         tm = TmuxManager(session_name="ccbot")
-        mock_session = MagicMock()
-        mock_session.windows = [
-            self._mock_window("@0", "renamed-somehow", "0"),
-            self._mock_window("@1", "proj", "1"),
-        ]
-        with patch.object(tm, "get_session", return_value=mock_session):
+        with self._patch_tmux_output(
+            [
+                self._pane_line("@0", "renamed-somehow", "0"),
+                self._pane_line("@1", "proj", "1"),
+            ]
+        ):
             windows = await tm.list_windows()
         assert [w.window_name for w in windows] == ["proj"]
+
+    @pytest.mark.asyncio
+    async def test_skips_inactive_panes(self) -> None:
+        tm = TmuxManager(session_name="ccbot")
+        with self._patch_tmux_output(
+            [
+                self._pane_line("@1", "proj", "1", active="0"),
+                self._pane_line("@1", "proj", "1", active="1"),
+            ]
+        ):
+            windows = await tm.list_windows()
+        assert [w.window_id for w in windows] == ["@1"]
+
+    @pytest.mark.asyncio
+    async def test_cache_ttl_and_invalidation(self) -> None:
+        """One real tmux call per TTL window; mutation drops the cache."""
+        tm = TmuxManager(session_name="ccbot")
+        with self._patch_tmux_output([self._pane_line("@1", "proj", "1")]) as mock_exec:
+            await tm.list_windows()
+            await tm.list_windows()  # within TTL — served from cache
+            assert mock_exec.call_count == 1
+            tm._invalidate_windows_cache()
+            await tm.list_windows()  # cache dropped — real call again
+            assert mock_exec.call_count == 2
 
 
 TMUX_SOCKET = "batchtest"
