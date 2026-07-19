@@ -354,6 +354,29 @@ class TestStatusPollLoopDeadWindowCleanup:
             mock_cleanup.assert_awaited_once_with(1, 42, mock_bot)
             assert mgr.get_window_for_thread(1, 42) is None
 
+    @pytest.mark.asyncio
+    async def test_mirror_disabled_parked_binding_preserved(
+        self, monkeypatch, mgr: SessionManager, mock_bot: AsyncMock
+    ) -> None:
+        """A parked binding (topic-name value, see session.resolve_stale_ids)
+        is deliberately preserved for adoption — the fallback cleanup must
+        never mistake it for a stale binding and tear it down."""
+        monkeypatch.setattr(config, "mirror_chat_id", None)
+        mgr.bind_thread(1, 42, "2 — proj", window_name="")
+
+        with (
+            patch("ccbot.handlers.status_polling.tmux_manager") as mock_tmux,
+            patch(
+                "ccbot.handlers.status_polling.clear_topic_state",
+                new_callable=AsyncMock,
+            ) as mock_cleanup,
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=None)
+            await _run_one_tick(mock_bot)
+
+            mock_cleanup.assert_not_called()
+            assert mgr.get_window_for_thread(1, 42) == "2 — proj"
+
 
 @pytest.fixture
 def _clear_probe_state():
@@ -501,3 +524,14 @@ class TestActiveDeletionProbe:
         due = status_polling._due_for_probe(now=10_000.0)
 
         assert due == [(1, 42, "@0")]
+
+    def test_gone_marker_bindings_are_never_probed(self, mgr: SessionManager) -> None:
+        """A "gone:@N" parked marker has no known topic name — probing
+        would RENAME the user's live topic to the marker string. Parked
+        topic-name values still probe (their name is the no-op edit)."""
+        mgr.bind_thread(1, 1, "gone:@5", window_name="")
+        mgr.bind_thread(1, 2, "2 — proj", window_name="")
+
+        due = status_polling._due_for_probe(now=10_000.0)
+
+        assert [t[2] for t in due] == ["2 — proj"]

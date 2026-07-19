@@ -1998,6 +1998,17 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     # Bound topic — forward to bound window
     w = await tmux_manager.find_window_by_id(wid)
     if not w:
+        if not session_manager._is_window_id(wid):
+            # Parked binding (see session.resolve_stale_ids): the terminal
+            # vanished while ccbot wasn't watching. Keep the binding — the
+            # mirror adopts it when a matching terminal reopens; unbinding
+            # here would orphan the topic and spawn a duplicate later.
+            await safe_reply(
+                update.message,
+                f"💤 This topic's terminal ('{wid}') is closed. Reopen a "
+                "terminal in the same slot to reconnect, then resend.",
+            )
+            return
         display = session_manager.get_display_name(wid)
         logger.info(
             "Stale binding: window %s gone, unbinding (user=%d, thread=%d)",

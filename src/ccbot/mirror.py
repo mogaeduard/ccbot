@@ -148,6 +148,20 @@ async def mirror_tick(bot: Bot) -> None:
     mirror_chat_id = config.mirror_chat_id
     if not mirror_chat_id:
         return
+    # A tmux server restart while ccbot runs recycles every window id:
+    # acting on the old bindings would delete live topics or adopt/bind
+    # the wrong terminals. Detect it (the anchor startup resolution
+    # persisted), re-resolve, and act on the corrected world next tick.
+    server_start = await tmux_manager.get_server_start_time()
+    if server_start and server_start != session_manager.tmux_server_start:
+        logger.warning("tmux server restart detected mid-run — re-resolving bindings")
+        await session_manager.resolve_stale_ids()
+        return
+    # Fresh listing each tick: adoption/deletion decisions from a ≤0.9s
+    # stale cache can act on a window killed right after the cached read
+    # (adopting a parked topic onto a dead id feeds it to deletion next
+    # tick). One extra fork per tick, only while the mirror is enabled.
+    tmux_manager._invalidate_windows_cache()
     await _create_topics(bot, mirror_chat_id)
     await _close_dead_topics(bot, mirror_chat_id)
 

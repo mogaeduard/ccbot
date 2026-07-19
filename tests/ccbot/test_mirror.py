@@ -44,6 +44,17 @@ def _mirror_chat_id(monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def _stable_server_anchor(monkeypatch):
+    """mirror_tick checks the tmux server start_time anchor before acting;
+    "" (unreadable) skips the check, so tests that don't care about
+    restart detection are unaffected."""
+    monkeypatch.setattr(
+        mirror.tmux_manager, "get_server_start_time", AsyncMock(return_value="")
+    )
+    yield
+
+
 def _window(
     window_id: str = "@0",
     window_name: str = "proj",
@@ -291,6 +302,52 @@ class TestCloseDeadTopics:
 
         bot.delete_forum_topic.assert_not_called()
         assert mgr.get_window_for_thread(user_id, 42) == "@0"
+
+
+class TestRuntimeServerRestart:
+    """A tmux server restart while ccbot runs recycles every window id —
+    the tick must re-resolve bindings instead of acting on them (deleting
+    live topics / adopting the wrong terminals)."""
+
+    @pytest.mark.asyncio
+    async def test_anchor_mismatch_reresolves_and_skips_tick(
+        self, monkeypatch, mgr, bot
+    ) -> None:
+        mgr.tmux_server_start = "srv-1"
+        monkeypatch.setattr(
+            mirror.tmux_manager,
+            "get_server_start_time",
+            AsyncMock(return_value="srv-2"),
+        )
+        resolve = AsyncMock()
+        monkeypatch.setattr(mgr, "resolve_stale_ids", resolve)
+        mgr.bind_thread(1, 42, "@0", window_name="proj")
+        monkeypatch.setattr(
+            mirror.tmux_manager, "list_windows", AsyncMock(return_value=[])
+        )
+
+        await mirror.mirror_tick(bot)
+
+        resolve.assert_awaited_once()
+        bot.create_forum_topic.assert_not_called()
+        bot.delete_forum_topic.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_matching_anchor_ticks_normally(self, monkeypatch, mgr, bot) -> None:
+        mgr.tmux_server_start = "srv-1"
+        monkeypatch.setattr(
+            mirror.tmux_manager,
+            "get_server_start_time",
+            AsyncMock(return_value="srv-1"),
+        )
+        w = _window(window_id="@0", window_name="proj")
+        monkeypatch.setattr(
+            mirror.tmux_manager, "list_windows", AsyncMock(return_value=[w])
+        )
+
+        await mirror.mirror_tick(bot)
+
+        bot.create_forum_topic.assert_awaited_once()
 
 
 class TestParkedBindings:

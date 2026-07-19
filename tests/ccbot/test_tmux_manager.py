@@ -26,7 +26,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from ccbot.tmux_manager import _LIST_SEP, TmuxManager
+from ccbot.tmux_manager import _LIST_RSEP, _LIST_SEP, TmuxManager
 
 
 class TestSendKeysLiteralBranch:
@@ -109,8 +109,16 @@ class TestListWindowsSkipsPlaceholder:
     external renamed the window away from "__main__")."""
 
     @staticmethod
-    def _pane_line(window_id: str, name: str, index: str, active: str = "1") -> str:
-        return _LIST_SEP.join((window_id, name, index, active, "/tmp", "zsh"))
+    def _pane_line(
+        window_id: str,
+        name: str,
+        index: str,
+        active: str = "1",
+        cwd: str = "/tmp",
+    ) -> str:
+        # Mirrors production _LIST_FORMAT: fields \x1f-joined, record
+        # terminated by \x1e (tmux then joins records with "\n").
+        return _LIST_SEP.join((window_id, name, index, active, cwd, "zsh")) + _LIST_RSEP
 
     @staticmethod
     def _patch_tmux_output(lines: list[str]):
@@ -156,6 +164,22 @@ class TestListWindowsSkipsPlaceholder:
         ):
             windows = await tm.list_windows()
         assert [w.window_id for w in windows] == ["@1"]
+
+    @pytest.mark.asyncio
+    async def test_newline_in_cwd_does_not_shatter_record(self) -> None:
+        """A window whose cwd (or name) contains a newline must stay
+        visible — a shattered record made the window invisible and its
+        topic got deleted while the terminal was alive."""
+        tm = TmuxManager(session_name="ccbot")
+        with self._patch_tmux_output(
+            [
+                self._pane_line("@1", "proj", "1", cwd="/tmp/we\nird"),
+                self._pane_line("@2", "other", "2"),
+            ]
+        ):
+            windows = await tm.list_windows()
+        assert [w.window_id for w in windows] == ["@1", "@2"]
+        assert windows[0].cwd == "/tmp/we\nird"
 
     @pytest.mark.asyncio
     async def test_cache_ttl_and_invalidation(self) -> None:

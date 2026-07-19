@@ -321,8 +321,12 @@ class SessionManager:
             if display == w.window_name:
                 return True
             idx = slot_index(display)
-            if idx and w.window_index:
-                return idx == w.window_index
+            if idx and w.window_index and idx == w.window_index:
+                # Slot equality alone isn't identity across a restart: the
+                # same slot reopened with a DIFFERENT project must not
+                # inherit the topic (same cwd guard as _match_stale's slot
+                # fallback — the two paths must agree).
+                return not (ws and ws.cwd and w.cwd and ws.cwd != w.cwd)
             return False
 
         def _survives(old_id: str) -> bool:
@@ -332,7 +336,17 @@ class SessionManager:
             return trust_live_ids or _is_same_window(old_id, w)
 
         changed = False
-        if server_start != self.tmux_server_start:
+        if not server_start:
+            # start_time unreadable (transient failure / exotic tmux): keep
+            # the previous anchor — overwriting it with "" would make the
+            # NEXT boot trust recycled ids verbatim. This boot already fails
+            # closed: a non-empty persisted anchor != "" → strict tier.
+            if self.tmux_server_start:
+                logger.warning(
+                    "tmux server start_time unavailable — keeping anchor %r",
+                    self.tmux_server_start,
+                )
+        elif server_start != self.tmux_server_start:
             self.tmux_server_start = server_start
             changed = True
 
@@ -468,7 +482,12 @@ class SessionManager:
                 # State keyed by a parked/ancient name that no binding
                 # references this run: reattach by name (legacy migration)
                 # or keep it while a parked binding still uses the key.
+                # Never onto a claimed window — a binding's own rekeyed
+                # state must not be displaced by an orphan (name keys sort
+                # first and would win the setdefault below).
                 target = live_by_name.get(key)
+                if target is not None and target.window_id in claimed:
+                    target = None
                 new_key = target.window_id if target else None
                 if new_key is None and key in parked_vals:
                     new_window_states[key] = ws
@@ -504,6 +523,8 @@ class SessionManager:
                 new_key = rekey.get(key)
                 if new_key is None and not self._is_window_id(key):
                     target = live_by_name.get(key)
+                    if target is not None and target.window_id in claimed:
+                        target = None  # same orphan guard as window_states
                     new_key = target.window_id if target else None
                     if new_key is None and key in parked_vals:
                         new_offsets[key] = off
@@ -582,6 +603,10 @@ class SessionManager:
             name_ok = bool(window.window_name) and val == window.window_name
             if not (slot_ok or name_ok):
                 continue
+            # cwd guard is evidence-based by design: a parked plain shell
+            # (no WindowState) has no remembered project, so slot identity
+            # alone decides — same vacuous pass as _match_stale's slot
+            # fallback with no remembered cwd. The topic means "Terminal N".
             ws = self.window_states.get(val)
             if ws and ws.cwd and window.cwd and ws.cwd != window.cwd:
                 logger.info(

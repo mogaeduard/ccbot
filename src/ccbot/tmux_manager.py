@@ -37,18 +37,25 @@ logger = logging.getLogger(__name__)
 # poll interval so each tick does exactly one real listing.
 _WINDOWS_CACHE_TTL = 0.9  # seconds
 
-# Field separator for the list-panes format string. Unit separator: cannot
-# appear in window names, paths, or commands.
+# Field/record separators for the list-panes format string. Unit/record
+# separator: cannot appear in window names, paths, or commands. Records are
+# split on _LIST_RSEP, NOT on newlines — a window name or cwd containing a
+# newline (legal on POSIX) would shatter its record into unparseable lines
+# and make a live window invisible (its topic would be deleted for it).
 _LIST_SEP = "\x1f"
-_LIST_FORMAT = _LIST_SEP.join(
-    (
-        "#{window_id}",
-        "#{window_name}",
-        "#{window_index}",
-        "#{pane_active}",
-        "#{pane_current_path}",
-        "#{pane_current_command}",
+_LIST_RSEP = "\x1e"
+_LIST_FORMAT = (
+    _LIST_SEP.join(
+        (
+            "#{window_id}",
+            "#{window_name}",
+            "#{window_index}",
+            "#{pane_active}",
+            "#{pane_current_path}",
+            "#{pane_current_command}",
+        )
     )
+    + _LIST_RSEP
 )
 
 
@@ -251,7 +258,16 @@ class TmuxManager:
         try:
             proc = await asyncio.create_subprocess_exec(
                 *self._tmux_argv(
-                    "list-panes", "-s", "-t", self.session_name, "-F", _LIST_FORMAT
+                    # "=" forces exact target-session match — bare names fall
+                    # back to prefix/fnmatch matching, so with "ccbot" gone a
+                    # sibling "ccbot2" session's windows would be listed (and
+                    # bound/topic'd) as ours.
+                    "list-panes",
+                    "-s",
+                    "-t",
+                    f"={self.session_name}",
+                    "-F",
+                    _LIST_FORMAT,
                 ),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -266,8 +282,11 @@ class TmuxManager:
             logger.error(f"Failed to list windows: {e}")
             return self._degraded_windows()
 
-        for line in stdout.decode("utf-8", "replace").splitlines():
-            parts = line.split(_LIST_SEP)
+        for record in stdout.decode("utf-8", "replace").split(_LIST_RSEP):
+            # tmux joins per-pane outputs with "\n"; the record separator is
+            # ours, so each record after the first starts with that join
+            # newline. window_id (field 1) never contains one — safe strip.
+            parts = record.lstrip("\n").split(_LIST_SEP)
             if len(parts) != 6:
                 continue
             window_id, name, index, pane_active, cwd, pane_cmd = parts

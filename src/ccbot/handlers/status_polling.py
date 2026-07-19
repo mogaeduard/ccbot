@@ -303,6 +303,11 @@ def _due_for_probe(now: float) -> list[tuple[int, int, str]]:
         (user_id, thread_id, wid)
         for user_id, thread_id, wid in session_manager.iter_thread_bindings()
         if now - _last_probed.get((user_id, thread_id), 0.0) >= PROBE_INTERVAL
+        # A "gone:@N" parked marker (see session.resolve_stale_ids) has no
+        # known topic name — probing would RENAME the user's live topic to
+        # the marker string. Other parked values are the topic name itself,
+        # so their probe is the designed no-op edit.
+        and not wid.startswith("gone:")
     ]
     due.sort(key=lambda t: _last_probed.get((t[0], t[1]), 0.0))
     return due[:PROBE_BATCH_SIZE]
@@ -328,6 +333,11 @@ async def status_poll_loop(bot: Bot) -> None:
                     # Clean up stale bindings (window no longer exists)
                     w = await tmux_manager.find_window_by_id(wid)
                     if not w:
+                        if not session_manager._is_window_id(wid):
+                            # Parked binding (topic-name value, see
+                            # session.resolve_stale_ids): deliberately
+                            # preserved for adoption — never "stale".
+                            continue
                         if not config.mirror_chat_id:
                             # No mirror running to own dead-window cleanup —
                             # fall back to the pre-mirror behavior (unbind +

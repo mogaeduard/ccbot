@@ -559,6 +559,61 @@ class TestResolveStaleIds:
         assert mgr.get_window_for_thread(100, 30) == "@5"
 
     @pytest.mark.asyncio
+    async def test_recycled_id_same_slot_different_project_parks(
+        self, mgr: SessionManager, monkeypatch
+    ) -> None:
+        """Post-restart, a recycled id in the SAME slot but a DIFFERENT
+        project must not keep the binding — _is_same_window's slot match
+        carries the same cwd guard as _match_stale's slot fallback."""
+        mgr.tmux_server_start = "srv-old"
+        mgr.bind_thread(100, 20, "@1", window_name="1 — eterni")
+        mgr.window_states["@1"] = WindowState(session_id="s", cwd="/home/eterni")
+        self._live(
+            monkeypatch,
+            [TmuxWindow("@1", "1 — castt", "/home/castt", window_index="1")],
+            server_start="srv-new",
+        )
+        await mgr.resolve_stale_ids()
+        assert mgr.get_window_for_thread(100, 20) == "1 — eterni"  # parked
+
+    @pytest.mark.asyncio
+    async def test_transient_empty_start_time_keeps_anchor(
+        self, mgr: SessionManager, monkeypatch
+    ) -> None:
+        """An unreadable start_time must not overwrite a good anchor with
+        "" — that would make the NEXT boot trust recycled ids verbatim.
+        This boot fails closed (strict tier), so provable identity holds."""
+        mgr.tmux_server_start = "srv-1"
+        mgr.bind_thread(100, 20, "@2", window_name="2 — foo")
+        self._live(
+            monkeypatch,
+            [TmuxWindow("@2", "2 — foo", "/x", window_index="2")],
+            server_start="",
+        )
+        await mgr.resolve_stale_ids()
+        assert mgr.tmux_server_start == "srv-1"
+        assert mgr.get_window_for_thread(100, 20) == "@2"
+
+    @pytest.mark.asyncio
+    async def test_orphan_name_state_never_displaces_rekeyed_binding_state(
+        self, mgr: SessionManager, monkeypatch
+    ) -> None:
+        """An orphan name-keyed WindowState (no binding references it) must
+        not claim a live window a rekeyed binding resolved to — name keys
+        sort before '@' keys and would win the setdefault, feeding the
+        wrong session's transcript into the topic."""
+        mgr.bind_thread(100, 10, "@3", window_name="1 — bar")
+        mgr.window_states["@3"] = WindowState(session_id="real", cwd="/x")
+        mgr.window_states["1 — foo"] = WindowState(session_id="orphan", cwd="/y")
+        self._live(
+            monkeypatch,
+            [TmuxWindow("@9", "1 — foo", "/x", window_index="1")],
+        )
+        await mgr.resolve_stale_ids()
+        assert mgr.get_window_for_thread(100, 10) == "@9"
+        assert mgr.window_states["@9"].session_id == "real"
+
+    @pytest.mark.asyncio
     async def test_no_identity_evidence_parks_after_server_restart(
         self, mgr: SessionManager, monkeypatch
     ) -> None:
